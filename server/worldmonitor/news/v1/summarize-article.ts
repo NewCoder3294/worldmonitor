@@ -61,6 +61,8 @@ export async function summarizeArticle(
       provider: provider,
       tokens: 0,
       fallback: true,
+      error: '',
+      errorType: '',
       status: 'SUMMARIZE_STATUS_SKIPPED',
       statusDetail: skipReasons[provider] || `Unknown provider: ${provider}`,
     };
@@ -76,6 +78,8 @@ export async function summarizeArticle(
       provider: provider,
       tokens: 0,
       fallback: false,
+      error: 'Headlines array required',
+      errorType: 'ValidationError',
       status: 'SUMMARIZE_STATUS_ERROR',
       statusDetail: 'Headlines array required',
     };
@@ -165,6 +169,8 @@ export async function summarizeArticle(
         provider: isCached ? 'cache' : provider,
         tokens: isCached ? 0 : (result.tokens || 0),
         fallback: false,
+        error: '',
+        errorType: '',
         status: isCached ? 'SUMMARIZE_STATUS_CACHED' : 'SUMMARIZE_STATUS_SUCCESS',
         statusDetail: '',
       };
@@ -176,6 +182,8 @@ export async function summarizeArticle(
       provider: provider,
       tokens: 0,
       fallback: true,
+      error: 'Empty response',
+      errorType: '',
       status: 'SUMMARIZE_STATUS_ERROR',
       statusDetail: 'Empty response',
     };
@@ -189,6 +197,8 @@ export async function summarizeArticle(
       provider: provider,
       tokens: 0,
       fallback: true,
+      error: error.message,
+      errorType: error.name,
       status: 'SUMMARIZE_STATUS_ERROR',
       statusDetail: `${error.name}: ${error.message}`,
     };

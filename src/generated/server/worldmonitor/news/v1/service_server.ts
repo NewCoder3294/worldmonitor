@@ -18,6 +18,8 @@ export interface SummarizeArticleResponse {
   provider: string;
   tokens: number;
   fallback: boolean;
+  error: string;
+  errorType: string;
   status: SummarizeStatus;
   statusDetail: string;
 }

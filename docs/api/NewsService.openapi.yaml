@@ -197,6 +197,12 @@ components:
                 fallback:
                     type: boolean
                     description: Whether the client should try the next provider in the fallback chain.
+                error:
+                    type: string
+                    description: Error message if the request failed.
+                errorType:
+                    type: string
+                    description: Error type/name (e.g. "TypeError").
                 status:
                     $ref: '#/components/schemas/SummarizeStatus'
                 statusDetail:

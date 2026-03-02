@@ -16,6 +16,8 @@ const EMPTY_MISS: SummarizeArticleResponse = {
   provider: '',
   tokens: 0,
   fallback: true,
+  error: '',
+  errorType: '',
   status: 'SUMMARIZE_STATUS_UNSPECIFIED',
   statusDetail: '',
 };
@@ -28,7 +30,7 @@ export async function getSummarizeArticleCache(
 
   if (!cacheKey || !CACHE_KEY_PATTERN.test(cacheKey)) {
     markNoCacheResponse(ctx.request);
-    return { ...EMPTY_MISS, status: 'SUMMARIZE_STATUS_ERROR', statusDetail: 'Invalid cache key' };
+    return { ...EMPTY_MISS, status: 'SUMMARIZE_STATUS_ERROR', statusDetail: 'Invalid cache key', error: 'Invalid cache key', errorType: 'ValidationError' };
   }
 
   try {
@@ -51,6 +53,8 @@ export async function getSummarizeArticleCache(
       provider: 'cache',
       tokens: 0,
       fallback: false,
+      error: '',
+      errorType: '',
       status: 'SUMMARIZE_STATUS_CACHED',
       statusDetail: '',
     };
