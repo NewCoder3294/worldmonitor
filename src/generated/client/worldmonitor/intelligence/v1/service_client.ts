@@ -125,7 +125,7 @@ export interface SearchGdeltDocumentsRequest {
 export interface SearchGdeltDocumentsResponse {
   articles: GdeltArticle[];
   query: string;
-  error: string;
+  serviceError?: ServiceError;
 }
 
 export interface GdeltArticle {
@@ -136,6 +136,11 @@ export interface GdeltArticle {
   image: string;
   language: string;
   tone: number;
+}
+
+export interface ServiceError {
+  code: string;
+  message: string;
 }
 
 export interface DeductSituationRequest {
