@@ -33,7 +33,6 @@ export async function listAirportDelays(
   _ctx: ServerContext,
   _req: ListAirportDelaysRequest,
 ): Promise<ListAirportDelaysResponse> {
-  const t0 = Date.now();
   // 1. FAA (US) — independent try-catch
   let faaAlerts: AirportDelayAlert[] = [];
   try {
