@@ -47,6 +47,9 @@ import { invokeTauri } from '@/services/tauri-bridge';
 import { dataFreshness } from '@/services/data-freshness';
 import { mlWorker } from '@/services/ml-worker';
 import { UnifiedSettings } from '@/components/UnifiedSettings';
+import { LayoutTabs } from '@/components/LayoutTabs';
+import { WidgetPicker } from '@/components/WidgetPicker';
+import { LAYOUT_OVERRIDES_PREFIX } from '@/config/layouts';
 import { t } from '@/services/i18n';
 import { TvModeController } from '@/services/tv-mode';
 
@@ -549,6 +552,55 @@ export class EventHandlerManager implements AppModule {
     }
   }
 
+  setupLayoutSystem(): void {
+    // Layout tabs
+    this.ctx.layoutTabs = new LayoutTabs({
+      getPanelSettings: () => this.ctx.panelSettings,
+      applyLayout: (panelKeys: string[]) => {
+        const keySet = new Set(panelKeys);
+        for (const [key, config] of Object.entries(this.ctx.panelSettings)) {
+          config.enabled = keySet.has(key);
+        }
+        saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
+        this.applyPanelSettings();
+        this.ctx.widgetPicker?.refresh();
+      },
+    });
+
+    const tabsMount = document.getElementById('layoutTabsMount');
+    if (tabsMount) tabsMount.appendChild(this.ctx.layoutTabs.getElement());
+
+    // Widget picker
+    this.ctx.widgetPicker = new WidgetPicker({
+      getPanelSettings: () => this.ctx.panelSettings,
+      togglePanel: (key: string) => {
+        const config = this.ctx.panelSettings[key];
+        if (config) {
+          config.enabled = !config.enabled;
+          trackPanelToggled(key, config.enabled);
+          saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
+          this.applyPanelSettings();
+          // Save overrides and update layout tab modified state
+          this.saveLayoutOverrides();
+          this.ctx.layoutTabs?.checkModified();
+        }
+      },
+      getLocalizedPanelName: (key: string, fallback: string) => this.getLocalizedPanelName(key, fallback),
+    });
+
+    const pickerMount = document.getElementById('widgetPickerMount');
+    if (pickerMount) pickerMount.appendChild(this.ctx.widgetPicker.getElement());
+  }
+
+  private saveLayoutOverrides(): void {
+    const activeId = this.ctx.layoutTabs?.getActiveLayoutId();
+    if (!activeId) return;
+    const enabledKeys = Object.entries(this.ctx.panelSettings)
+      .filter(([, c]) => c.enabled)
+      .map(([k]) => k);
+    localStorage.setItem(LAYOUT_OVERRIDES_PREFIX + activeId, JSON.stringify(enabledKeys));
+  }
+
   setupUnifiedSettings(): void {
     this.ctx.unifiedSettings = new UnifiedSettings({
       getPanelSettings: () => this.ctx.panelSettings,
@@ -932,6 +984,20 @@ export class EventHandlerManager implements AppModule {
       }
       const panel = this.ctx.panels[key];
       panel?.toggle(config.enabled);
+      if (panel && !panel.onClose) {
+        panel.onClose = (panelId: string) => {
+          const cfg = this.ctx.panelSettings[panelId];
+          if (cfg) {
+            cfg.enabled = false;
+            trackPanelToggled(panelId, false);
+            saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
+            this.applyPanelSettings();
+            this.saveLayoutOverrides();
+            this.ctx.layoutTabs?.checkModified();
+            this.ctx.widgetPicker?.refresh();
+          }
+        };
+      }
     });
   }
 }
