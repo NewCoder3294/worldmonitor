@@ -625,12 +625,40 @@ canvas,
   gap: 12px;
 }
 
-/* Layout tabs */
+/* Drop zone controls (layout tabs + widget picker) */
+.drop-zone-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+}
+
+.drop-zone-label {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 8px;
+  padding: 40px 12px;
+  border: 1.5px dashed var(--text-dim);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  opacity: 1;
+  pointer-events: none;
+}
+
+.map-bottom-grid:has(.panel) > .drop-zone-label {
+  display: none;
+}
+
 .layout-tabs {
   display: flex;
   align-items: center;
   gap: 2px;
-  margin: 0 12px;
+  margin: 0;
   flex-shrink: 1;
   overflow-x: auto;
 }
@@ -682,7 +710,7 @@ canvas,
 }
 
 @media (max-width: 900px) {
-  .layout-tabs {
+  .drop-zone-controls {
     display: none;
   }
 }
@@ -1141,6 +1169,26 @@ canvas,
 .map-section.resizing .map-resize-handle::after {
   background: var(--green);
   opacity: 1;
+}
+
+.map-bottom-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  grid-template-rows: auto 1fr;
+  grid-auto-rows: minmax(200px, 380px);
+  gap: 4px;
+  padding: 4px;
+  min-height: 28px;
+}
+
+.map-bottom-grid > .drop-zone-controls {
+  grid-column: 1 / -1;
+  grid-row: 1;
+}
+
+.map-bottom-grid > .drop-zone-label {
+  grid-column: 1 / -1;
+  grid-row: 2;
 }
 
 .map-section.pinned {
@@ -16533,7 +16581,7 @@ body.has-breaking-alert .panels-grid {
     transition: height 0.4s cubic-bezier(0.4, 0, 0.2, 1) !important;
   }
 
-  .map-bottom-grid:empty {
+  .map-bottom-grid:not(:has(.panel)) {
     border-top: none;
     padding: 0;
   }
