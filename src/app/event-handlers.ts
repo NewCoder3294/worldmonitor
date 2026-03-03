@@ -204,7 +204,6 @@ export class EventHandlerManager implements AppModule {
         try {
           this.ctx.panelSettings = JSON.parse(e.newValue) as Record<string, PanelConfig>;
           this.applyPanelSettings();
-          this.ctx.unifiedSettings?.refreshPanelToggles();
         } catch (_) { }
       }
       if (e.key === STORAGE_KEYS.liveChannels && e.newValue) {
@@ -603,16 +602,6 @@ export class EventHandlerManager implements AppModule {
 
   setupUnifiedSettings(): void {
     this.ctx.unifiedSettings = new UnifiedSettings({
-      getPanelSettings: () => this.ctx.panelSettings,
-      togglePanel: (key: string) => {
-        const config = this.ctx.panelSettings[key];
-        if (config) {
-          config.enabled = !config.enabled;
-          trackPanelToggled(key, config.enabled);
-          saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
-          this.applyPanelSettings();
-        }
-      },
       getDisabledSources: () => this.ctx.disabledSources,
       toggleSource: (name: string) => {
         if (this.ctx.disabledSources.has(name)) {
@@ -630,15 +619,6 @@ export class EventHandlerManager implements AppModule {
         saveToStorage(STORAGE_KEYS.disabledFeeds, Array.from(this.ctx.disabledSources));
       },
       getAllSourceNames: () => this.getAllSourceNames(),
-      getLocalizedPanelName: (key: string, fallback: string) => this.getLocalizedPanelName(key, fallback),
-      resetLayout: () => {
-        localStorage.removeItem(this.ctx.PANEL_SPANS_KEY);
-        localStorage.removeItem('worldmonitor-panel-col-spans');
-        localStorage.removeItem(this.ctx.PANEL_ORDER_KEY);
-        localStorage.removeItem(this.ctx.PANEL_ORDER_KEY + '-bottom');
-        localStorage.removeItem('map-height');
-        window.location.reload();
-      },
       isDesktopApp: this.ctx.isDesktopApp,
       statusPanel: this.ctx.statusPanel,
     });
