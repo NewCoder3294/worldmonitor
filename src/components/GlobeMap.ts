@@ -1531,7 +1531,8 @@ export class GlobeMap {
       html = '';
     }
     el.innerHTML = `<div style="padding-right:16px;position:relative;">${closeBtn}${html}</div>`;
-    if (d._kind === 'satellite') el.style.maxWidth = '300px';
+    const wideKinds = new Set(['satellite', 'flightDelay', 'conflictZone', 'cableAdvisory']);
+    if (wideKinds.has(d._kind)) el.style.maxWidth = '300px';
     el.querySelector('button')?.addEventListener('click', () => this.hideTooltip());
 
     if (d._kind === 'webcam') {
