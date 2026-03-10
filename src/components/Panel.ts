@@ -643,7 +643,7 @@ export class Panel {
     if (!headerLeft) return;
     const badge = document.createElement('span');
     badge.className = 'panel-live-count';
-    badge.textContent = `${count} live`;
+    badge.textContent = `${count}`;
     headerLeft.appendChild(badge);
   }
 
