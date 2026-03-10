@@ -649,7 +649,7 @@ export class Panel {
 
   protected appendCloseButton(): void {
     const closeBtn = h('button', {
-      className: 'panel-close-btn',
+      className: 'icon-btn panel-close-btn',
       'aria-label': t('components.panel.closePanel'),
       title: t('components.panel.closePanel'),
     }, '\u00d7');
