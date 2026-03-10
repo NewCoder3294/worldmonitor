@@ -769,6 +769,20 @@ export class PanelLayoutManager implements AppModule {
       }
     });
 
+    // Listen for panel close (X) button clicks via event delegation
+    const handlePanelClose = (e: Event) => {
+      const { panelId } = (e as CustomEvent).detail;
+      const config = this.ctx.panelSettings[panelId];
+      if (config) {
+        config.enabled = false;
+        saveToStorage(STORAGE_KEYS.panels, this.ctx.panelSettings);
+        this.applyPanelSettings();
+        this.ctx.unifiedSettings?.refreshPanelToggles();
+      }
+    };
+    panelsGrid.addEventListener('panel-close', handlePanelClose);
+    document.getElementById('mapBottomGrid')?.addEventListener('panel-close', handlePanelClose);
+
     window.addEventListener('resize', () => this.ensureCorrectZones());
 
     this.ctx.map.onTimeRangeChanged((range) => {
@@ -991,6 +1005,12 @@ export class PanelLayoutManager implements AppModule {
     }
   }
 
+  private dragGhost: HTMLElement | null = null;
+  private dragPlaceholder: HTMLElement | null = null;
+  private dragSourceEl: HTMLElement | null = null;
+  private dragOffsetX = 0;
+  private dragOffsetY = 0;
+
   private makeDraggable(el: HTMLElement, key: string): void {
     el.dataset.panel = key;
     let isDragging = false;
@@ -1026,13 +1046,14 @@ export class PanelLayoutManager implements AppModule {
         const dy = Math.abs(e.clientY - startY);
         if (dx < DRAG_THRESHOLD && dy < DRAG_THRESHOLD) return;
         dragStarted = true;
-        el.classList.add('dragging');
+        this.startDragGhost(el, startX, startY);
       }
       const cx = e.clientX;
       const cy = e.clientY;
       if (rafId) cancelAnimationFrame(rafId);
       rafId = requestAnimationFrame(() => {
-        this.handlePanelDragMove(el, cx, cy);
+        this.updateDragGhost(cx, cy);
+        this.handlePanelDragMove(cx, cy);
         rafId = 0;
       });
     };
@@ -1042,8 +1063,7 @@ export class PanelLayoutManager implements AppModule {
       isDragging = false;
       if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
       if (dragStarted) {
-        el.classList.remove('dragging');
-        this.savePanelOrder();
+        this.endDragGhost();
       }
       dragStarted = false;
     };
@@ -1062,19 +1082,87 @@ export class PanelLayoutManager implements AppModule {
       }
       isDragging = false;
       dragStarted = false;
-      el.classList.remove('dragging');
+      this.cleanupDragArtifacts();
     });
   }
 
-  private handlePanelDragMove(dragging: HTMLElement, clientX: number, clientY: number): void {
+  private startDragGhost(el: HTMLElement, mouseX: number, mouseY: number): void {
+    this.dragSourceEl = el;
+    const rect = el.getBoundingClientRect();
+    this.dragOffsetX = mouseX - rect.left;
+    this.dragOffsetY = mouseY - rect.top;
+
+    // Create ghost overlay — a semi-transparent copy that follows the cursor
+    const ghost = document.createElement('div');
+    ghost.className = 'panel-drag-ghost';
+    ghost.style.width = `${rect.width}px`;
+    ghost.style.height = `${rect.height}px`;
+    ghost.style.left = `${rect.left}px`;
+    ghost.style.top = `${rect.top}px`;
+
+    // Copy just the header into the ghost for a lightweight preview
+    const header = el.querySelector('.panel-header');
+    if (header) {
+      const headerClone = header.cloneNode(true) as HTMLElement;
+      ghost.appendChild(headerClone);
+    }
+
+    document.body.appendChild(ghost);
+    this.dragGhost = ghost;
+
+    // Create placeholder that occupies the original space
+    const placeholder = document.createElement('div');
+    placeholder.className = 'panel-drag-placeholder';
+    placeholder.style.height = `${rect.height}px`;
+    // Copy the grid span classes so the placeholder takes the same space
+    for (const cls of el.classList) {
+      if (cls.startsWith('span-') || cls.startsWith('col-span-') || cls === 'panel-wide') {
+        placeholder.classList.add(cls);
+      }
+    }
+    el.parentElement?.insertBefore(placeholder, el);
+    this.dragPlaceholder = placeholder;
+
+    // Hide the real panel (keep its space via the placeholder)
+    el.classList.add('dragging');
+  }
+
+  private updateDragGhost(mouseX: number, mouseY: number): void {
+    if (!this.dragGhost) return;
+    this.dragGhost.style.left = `${mouseX - this.dragOffsetX}px`;
+    this.dragGhost.style.top = `${mouseY - this.dragOffsetY}px`;
+  }
+
+  private endDragGhost(): void {
+    if (this.dragSourceEl && this.dragPlaceholder) {
+      // Insert the real panel where the placeholder is
+      const parent = this.dragPlaceholder.parentElement;
+      if (parent) {
+        parent.insertBefore(this.dragSourceEl, this.dragPlaceholder);
+      }
+      this.dragSourceEl.classList.remove('dragging');
+      this.savePanelOrder();
+    }
+    this.cleanupDragArtifacts();
+  }
+
+  private cleanupDragArtifacts(): void {
+    this.dragGhost?.remove();
+    this.dragGhost = null;
+    this.dragPlaceholder?.remove();
+    this.dragPlaceholder = null;
+    if (this.dragSourceEl) {
+      this.dragSourceEl.classList.remove('dragging');
+      this.dragSourceEl = null;
+    }
+  }
+
+  private handlePanelDragMove(clientX: number, clientY: number): void {
     const grid = document.getElementById('panelsGrid');
     const bottomGrid = document.getElementById('mapBottomGrid');
-    if (!grid || !bottomGrid) return;
+    if (!grid || !bottomGrid || !this.dragPlaceholder) return;
 
-    dragging.style.pointerEvents = 'none';
     const target = document.elementFromPoint(clientX, clientY);
-    dragging.style.pointerEvents = '';
-
     if (!target) return;
 
     // Check if we are over a grid or a panel inside a grid
@@ -1086,42 +1174,44 @@ export class PanelLayoutManager implements AppModule {
     const currentTargetGrid = targetGrid || (targetPanel ? targetPanel.parentElement as HTMLElement : null);
     if (!currentTargetGrid || (currentTargetGrid !== grid && currentTargetGrid !== bottomGrid)) return;
 
-    if (targetPanel && targetPanel !== dragging && !targetPanel.classList.contains('hidden')) {
+    const placeholder = this.dragPlaceholder;
+
+    if (targetPanel && targetPanel !== this.dragSourceEl && !targetPanel.classList.contains('hidden') && targetPanel !== placeholder) {
       const targetRect = targetPanel.getBoundingClientRect();
-      const draggingRect = dragging.getBoundingClientRect();
+      const placeholderRect = placeholder.getBoundingClientRect();
 
       const children = Array.from(currentTargetGrid.children);
-      const dragIdx = children.indexOf(dragging);
+      const phIdx = children.indexOf(placeholder);
       const targetIdx = children.indexOf(targetPanel);
 
-      const sameRow = Math.abs(draggingRect.top - targetRect.top) < 30;
+      const sameRow = Math.abs(placeholderRect.top - targetRect.top) < 30;
       const targetMid = sameRow
         ? targetRect.left + targetRect.width / 2
         : targetRect.top + targetRect.height / 2;
       const cursorPos = sameRow ? clientX : clientY;
 
-      if (dragIdx === -1) {
-        // Moving from one grid to another
+      if (phIdx === -1) {
+        // Moving placeholder from one grid to another
         if (cursorPos < targetMid) {
-          currentTargetGrid.insertBefore(dragging, targetPanel);
+          currentTargetGrid.insertBefore(placeholder, targetPanel);
         } else {
-          currentTargetGrid.insertBefore(dragging, targetPanel.nextSibling);
+          currentTargetGrid.insertBefore(placeholder, targetPanel.nextSibling);
         }
       } else {
         // Reordering within same grid
-        if (dragIdx < targetIdx) {
+        if (phIdx < targetIdx) {
           if (cursorPos > targetMid) {
-            currentTargetGrid.insertBefore(dragging, targetPanel.nextSibling);
+            currentTargetGrid.insertBefore(placeholder, targetPanel.nextSibling);
           }
         } else {
           if (cursorPos < targetMid) {
-            currentTargetGrid.insertBefore(dragging, targetPanel);
+            currentTargetGrid.insertBefore(placeholder, targetPanel);
           }
         }
       }
-    } else if (currentTargetGrid !== dragging.parentElement) {
+    } else if (currentTargetGrid !== placeholder.parentElement) {
       // Dragging over an empty or near-empty grid zone
-      currentTargetGrid.appendChild(dragging);
+      currentTargetGrid.appendChild(placeholder);
     }
   }
 

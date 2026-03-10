@@ -248,6 +248,21 @@ export class Panel {
     this.statusBadgeEl.style.display = 'none';
     this.header.appendChild(this.statusBadgeEl);
 
+    // Close (X) button — allows hiding the panel directly from the header
+    const closeBtn = h('button', {
+      className: 'panel-close-btn',
+      'aria-label': t('components.panel.close'),
+      title: t('components.panel.close'),
+    }, '\u00d7');
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.element.dispatchEvent(new CustomEvent('panel-close', {
+        detail: { panelId: this.panelId },
+        bubbles: true,
+      }));
+    });
+    this.header.appendChild(closeBtn);
+
     if (options.showCount) {
       this.countEl = document.createElement('span');
       this.countEl.className = 'panel-count';
