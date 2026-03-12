@@ -7,6 +7,7 @@ on:
       - 'src/generated/**'
       - 'docs/api/**'
       - 'Makefile'
+      - '.github/workflows/proto-check.yml'
 
 jobs:
   proto-freshness:
@@ -39,4 +40,16 @@ jobs:
             echo "============================================================"
             exit 1
           fi
+
+          UNTRACKED=$(git ls-files --others --exclude-standard src/generated/ docs/api/)
+          if [ -n "$UNTRACKED" ]; then
+            echo ""
+            echo "============================================================"
+            echo "ERROR: Untracked generated files found:"
+            echo "$UNTRACKED"
+            echo "Run 'make generate' locally and commit the new files."
+            echo "============================================================"
+            exit 1
+          fi
+
           echo "Proto-generated code is up to date."
