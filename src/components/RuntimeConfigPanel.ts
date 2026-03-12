@@ -216,8 +216,8 @@ export class RuntimeConfigPanel extends Panel {
             ${availableFeatures}/${totalFeatures} ${t('modals.runtimeConfig.summary.available')}${configuredCount > 0 ? ` · ${configuredCount} ${t('modals.runtimeConfig.summary.secrets')}` : ''}.
           </p>
           <p class="runtime-alert-skip">${t('modals.runtimeConfig.skipSetup')}</p>
-          <button type="button" class="runtime-open-settings-btn" data-open-settings>
-            ${t('modals.runtimeConfig.openSettings')}
+          <button type="button" class="runtime-early-access-btn" data-early-access>
+            ${t('modals.runtimeConfig.reserveEarlyAccess')}
           </button>
         </section>
       `;
@@ -342,10 +342,13 @@ export class RuntimeConfigPanel extends Panel {
     if (!isDesktopRuntime()) return;
 
     if (this.mode === 'alert') {
-      this.content.querySelector<HTMLButtonElement>('[data-open-settings]')?.addEventListener('click', () => {
-        void invokeTauri<void>('open_settings_window_command').catch((error) => {
-          console.warn('[runtime-config] Failed to open settings window', error);
-        });
+      this.content.querySelector<HTMLButtonElement>('[data-early-access]')?.addEventListener('click', () => {
+        const url = 'https://www.worldmonitor.app/pro';
+        if (isDesktopRuntime()) {
+          void invokeTauri<void>('open_url', { url }).catch(() => window.open(url, '_blank'));
+        } else {
+          window.open(url, '_blank');
+        }
       });
       return;
     }
@@ -538,6 +541,8 @@ export class RuntimeConfigPanel extends Panel {
         }
       } catch { /* Ollama endpoint not available, try OpenAI format */ }
 
+      if (!select.isConnected) return;
+
       if (models.length === 0) {
         try {
           const res = await fetch(new URL('/v1/models', ollamaUrl).toString(), {
@@ -549,6 +554,8 @@ export class RuntimeConfigPanel extends Panel {
           }
         } catch { /* OpenAI endpoint also unavailable */ }
       }
+
+      if (!select.isConnected) return;
 
       if (models.length === 0) {
         // No models discovered — show manual text input as fallback

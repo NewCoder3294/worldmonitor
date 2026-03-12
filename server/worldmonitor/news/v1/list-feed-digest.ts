@@ -6,12 +6,34 @@ import type {
   NewsItem as ProtoNewsItem,
   ThreatLevel as ProtoThreatLevel,
 } from '../../../../src/generated/server/worldmonitor/news/v1/service_server';
-import { cachedFetchJson } from '../../../_shared/redis';
+import { cachedFetchJson, getCachedJsonBatch } from '../../../_shared/redis';
+import { sha256Hex } from '../../../_shared/hash';
 import { CHROME_UA } from '../../../_shared/constants';
 import { VARIANT_FEEDS, INTEL_SOURCES, type ServerFeed } from './_feeds';
 import { classifyByKeyword, type ThreatLevel } from './_classifier';
 
-const VALID_VARIANTS = new Set(['full', 'tech', 'finance', 'happy']);
+function getRelayBaseUrl(): string | null {
+  const relayUrl = process.env.WS_RELAY_URL;
+  if (!relayUrl) return null;
+  return relayUrl
+    .replace(/^ws(s?):\/\//, 'http$1://')
+    .replace(/\/$/, '');
+}
+
+function getRelayHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'User-Agent': CHROME_UA,
+    Accept: 'application/rss+xml, application/xml, text/xml, */*',
+  };
+  const relaySecret = process.env.RELAY_SHARED_SECRET;
+  if (relaySecret) {
+    const relayHeader = (process.env.RELAY_AUTH_HEADER || 'x-relay-key').toLowerCase();
+    headers[relayHeader] = relaySecret;
+  }
+  return headers;
+}
+
+const VALID_VARIANTS = new Set(['full', 'tech', 'finance', 'happy', 'commodity']);
 const fallbackDigestCache = new Map<string, { data: ListFeedDigestResponse; ts: number }>();
 const ITEMS_PER_FEED = 5;
 const MAX_ITEMS_PER_CATEGORY = 20;
@@ -36,7 +58,33 @@ interface ParsedItem {
   level: ThreatLevel;
   category: string;
   confidence: number;
-  classSource: 'keyword';
+  classSource: 'keyword' | 'llm';
+}
+
+async function fetchRssText(
+  url: string,
+  signal: AbortSignal,
+): Promise<string | null> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FEED_TIMEOUT_MS);
+  const onAbort = () => controller.abort();
+  signal.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': CHROME_UA,
+        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      signal: controller.signal,
+    });
+    if (!resp.ok) return null;
+    return await resp.text();
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener('abort', onAbort);
+  }
 }
 
 async function fetchAndParseRss(
@@ -48,29 +96,33 @@ async function fetchAndParseRss(
 
   try {
     const cached = await cachedFetchJson<ParsedItem[]>(cacheKey, 600, async () => {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), FEED_TIMEOUT_MS);
+      // Try direct fetch first
+      let text = await fetchRssText(feed.url, signal).catch(() => null);
 
-      const onAbort = () => controller.abort();
-      signal.addEventListener('abort', onAbort, { once: true });
-
-      try {
-        const resp = await fetch(feed.url, {
-          headers: {
-            'User-Agent': CHROME_UA,
-            'Accept': 'application/rss+xml, application/xml, text/xml, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-          },
-          signal: controller.signal,
-        });
-        if (!resp.ok) return null;
-
-        const text = await resp.text();
-        return parseRssXml(text, feed, variant);
-      } finally {
-        clearTimeout(timeout);
-        signal.removeEventListener('abort', onAbort);
+      // Fallback: route through Railway relay (different IP, avoids Vercel blocks)
+      if (!text) {
+        const relayBase = getRelayBaseUrl();
+        if (relayBase) {
+          const relayUrl = `${relayBase}/rss?url=${encodeURIComponent(feed.url)}`;
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), FEED_TIMEOUT_MS);
+          const onAbort = () => controller.abort();
+          signal.addEventListener('abort', onAbort, { once: true });
+          try {
+            const resp = await fetch(relayUrl, {
+              headers: getRelayHeaders(),
+              signal: controller.signal,
+            });
+            if (resp.ok) text = await resp.text();
+          } catch { /* relay also failed */ } finally {
+            clearTimeout(timeout);
+            signal.removeEventListener('abort', onAbort);
+          }
+        }
       }
+
+      if (!text) return null;
+      return parseRssXml(text, feed, variant);
     });
 
     return cached ?? [];
@@ -158,6 +210,37 @@ function decodeXmlEntities(s: string): string {
     .replace(/&apos;/g, "'")
     .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
     .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16)));
+}
+
+async function enrichWithAiCache(items: ParsedItem[]): Promise<void> {
+  const candidates = items.filter(i => i.classSource === 'keyword');
+  if (candidates.length === 0) return;
+
+  const keyMap = new Map<string, ParsedItem[]>();
+  for (const item of candidates) {
+    const hash = (await sha256Hex(item.title.toLowerCase())).slice(0, 16);
+    const key = `classify:sebuf:v1:${hash}`;
+    const existing = keyMap.get(key) ?? [];
+    existing.push(item);
+    keyMap.set(key, existing);
+  }
+
+  const keys = [...keyMap.keys()];
+  const cached = await getCachedJsonBatch(keys);
+
+  for (const [key, relatedItems] of keyMap) {
+    const hit = cached.get(key) as { level?: string; category?: string } | undefined;
+    if (!hit || hit.level === '_skip' || !hit.level || !hit.category) continue;
+
+    for (const item of relatedItems) {
+      if (0.9 <= item.confidence) continue;
+      item.level = hit.level as typeof item.level;
+      item.category = hit.category;
+      item.confidence = 0.9;
+      item.classSource = 'llm';
+      item.isAlert = hit.level === 'critical' || hit.level === 'high';
+    }
+  }
 }
 
 function toProtoItem(item: ParsedItem): ProtoNewsItem {
@@ -256,10 +339,18 @@ async function buildDigest(variant: string, lang: string): Promise<ListFeedDiges
       }
     }
 
+    const slicedByCategory = new Map<string, ParsedItem[]>();
     for (const [category, items] of results) {
       items.sort((a, b) => b.publishedAt - a.publishedAt);
+      slicedByCategory.set(category, items.slice(0, MAX_ITEMS_PER_CATEGORY));
+    }
+
+    const allSliced = [...slicedByCategory.values()].flat();
+    await enrichWithAiCache(allSliced);
+
+    for (const [category, sliced] of slicedByCategory) {
       categories[category] = {
-        items: items.slice(0, MAX_ITEMS_PER_CATEGORY).map(toProtoItem),
+        items: sliced.map(toProtoItem),
       };
     }
 

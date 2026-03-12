@@ -18,6 +18,13 @@ const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
 
+function requireShared(name) {
+  const candidates = [path.join(__dirname, '..', 'shared', name), path.join(__dirname, 'shared', name)];
+  for (const p of candidates) { try { return require(p); } catch {} }
+  throw new Error(`Cannot find shared/${name}`);
+}
+const RSS_ALLOWED_DOMAINS = new Set(requireShared('rss-allowed-domains.cjs'));
+
 // Log effective heap limit at startup (verifies NODE_OPTIONS=--max-old-space-size is active)
 const _heapStats = v8.getHeapStatistics();
 console.log(`[Relay] Heap limit: ${(_heapStats.heap_size_limit / 1024 / 1024).toFixed(0)}MB`);
@@ -73,12 +80,26 @@ const RELAY_RSS_RATE_LIMIT_MAX = Number.isFinite(Number(process.env.RELAY_RSS_RA
 const RELAY_LOG_THROTTLE_MS = Math.max(1000, Number(process.env.RELAY_LOG_THROTTLE_MS || 10000));
 const ALLOW_VERCEL_PREVIEW_ORIGINS = process.env.ALLOW_VERCEL_PREVIEW_ORIGINS === 'true';
 
+// OpenSky proxy — routes through residential proxy to avoid Railway IP blocks
+const OPENSKY_PROXY_AUTH = process.env.OPENSKY_PROXY_AUTH || process.env.OREF_PROXY_AUTH || '';
+const OPENSKY_PROXY_ENABLED = !!OPENSKY_PROXY_AUTH;
+
 // OREF (Israel Home Front Command) siren alerts — fetched via HTTP proxy (Israel exit)
 const OREF_PROXY_AUTH = process.env.OREF_PROXY_AUTH || ''; // format: user:pass@host:port
 const OREF_ALERTS_URL = 'https://www.oref.org.il/WarningMessages/alert/alerts.json';
 const OREF_HISTORY_URL = 'https://www.oref.org.il/WarningMessages/alert/History/AlertsHistory.json';
 const OREF_POLL_INTERVAL_MS = Math.max(30_000, Number(process.env.OREF_POLL_INTERVAL_MS || 300_000));
 const OREF_ENABLED = !!OREF_PROXY_AUTH;
+const OREF_DATA_DIR = process.env.OREF_DATA_DIR || '';
+const OREF_LOCAL_FILE = (() => {
+  if (!OREF_DATA_DIR) return '';
+  try {
+    const stat = require('fs').statSync(OREF_DATA_DIR);
+    if (!stat.isDirectory()) { console.warn(`[Relay] OREF_DATA_DIR is not a directory: ${OREF_DATA_DIR}`); return ''; }
+  } catch { console.warn(`[Relay] OREF_DATA_DIR does not exist: ${OREF_DATA_DIR}`); return ''; }
+  console.log(`[Relay] OREF local persistence: ${OREF_DATA_DIR}`);
+  return path.join(OREF_DATA_DIR, 'oref-history.json');
+})();
 const RELAY_OREF_RATE_LIMIT_MAX = Number.isFinite(Number(process.env.RELAY_OREF_RATE_LIMIT_MAX))
   ? Number(process.env.RELAY_OREF_RATE_LIMIT_MAX) : 600;
 
@@ -101,6 +122,7 @@ const UPSTASH_ENABLED = !!(
 );
 const RELAY_ENV_PREFIX = process.env.RELAY_ENV ? `${process.env.RELAY_ENV}:` : '';
 const OREF_REDIS_KEY = `${RELAY_ENV_PREFIX}relay:oref:history:v1`;
+const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
 if (UPSTASH_REDIS_REST_URL && !UPSTASH_REDIS_REST_URL.startsWith('https://')) {
   console.warn('[Relay] UPSTASH_REDIS_REST_URL must start with https:// — Redis disabled');
@@ -162,6 +184,41 @@ function upstashSet(key, value, ttlSeconds) {
     });
     req.on('error', () => resolve(false));
     req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.end(body);
+  });
+}
+
+function upstashMGet(keys) {
+  return new Promise((resolve) => {
+    if (!UPSTASH_ENABLED || keys.length === 0) return resolve([]);
+    const url = new URL('/pipeline', UPSTASH_REDIS_REST_URL);
+    const body = JSON.stringify(keys.map((k) => ['GET', k]));
+    const req = https.request(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 10000,
+    }, (resp) => {
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        resp.resume();
+        return resolve(keys.map(() => null));
+      }
+      let data = '';
+      resp.on('data', (chunk) => { data += chunk; });
+      resp.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve(parsed.map((r) => {
+            if (!r?.result) return null;
+            try { return JSON.parse(r.result); } catch { return null; }
+          }));
+        } catch { resolve(keys.map(() => null)); }
+      });
+    });
+    req.on('error', () => resolve(keys.map(() => null)));
+    req.on('timeout', () => { req.destroy(); resolve(keys.map(() => null)); });
     req.end(body);
   });
 }
@@ -540,7 +597,7 @@ function orefCurlFetch(proxyAuth, url, { toFile } = {}) {
   const { execFileSync } = require('child_process');
   const proxyUrl = `http://${proxyAuth}`;
   const args = [
-    '-sS', '-x', proxyUrl, '--max-time', '15',
+    '-sS', '--compressed', '-x', proxyUrl, '--max-time', '15',
     '-H', 'Accept: application/json',
     '-H', 'Referer: https://www.oref.org.il/',
     '-H', 'X-Requested-With: XMLHttpRequest',
@@ -661,6 +718,7 @@ async function orefBootstrapHistoryFromUpstream() {
   orefState.bootstrapSource = 'upstream';
   if (history.length > 0) orefState._persistVersion++;
   console.log(`[Relay] OREF history bootstrap: ${totalAlertRecords} records across ${history.length} waves`);
+  orefSaveLocalHistory();
 }
 
 const OREF_PERSIST_MAX_WAVES = 200;
@@ -682,18 +740,88 @@ async function orefPersistHistory() {
       history: waves,
       historyCount24h: orefState.historyCount24h,
       totalHistoryCount: orefState.totalHistoryCount,
+      activeAlertCount: orefState.lastAlerts?.length || 0,
       persistedAt: new Date().toISOString(),
     };
     const ok = await upstashSet(OREF_REDIS_KEY, payload, OREF_PERSIST_TTL_SECONDS);
     if (ok) {
       orefState._lastPersistedVersion = versionAtStart;
     }
+    orefSaveLocalHistory();
   } finally {
     orefState._persistInFlight = false;
   }
 }
 
+function orefLoadLocalHistory() {
+  if (!OREF_LOCAL_FILE) return null;
+  try {
+    const raw = require('fs').readFileSync(OREF_LOCAL_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data.history) || data.history.length === 0) return null;
+    const valid = data.history.every(
+      h => Array.isArray(h.alerts) && typeof h.timestamp === 'string'
+    );
+    if (!valid) return null;
+    const purgeCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const filtered = data.history.filter(
+      h => new Date(h.timestamp).getTime() > purgeCutoff
+    );
+    if (filtered.length === 0) {
+      console.log('[Relay] OREF local file data all stale (>7d)');
+      return null;
+    }
+    console.log(`[Relay] OREF local file: ${filtered.length} waves (saved ${data.savedAt || 'unknown'})`);
+    return filtered;
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.warn('[Relay] OREF local file read error:', err.message);
+    return null;
+  }
+}
+
+function orefSaveLocalHistory() {
+  if (!OREF_LOCAL_FILE) return;
+  try {
+    const fs = require('fs');
+    let waves = orefState.history;
+    if (waves.length > OREF_PERSIST_MAX_WAVES) {
+      waves = waves.slice(-OREF_PERSIST_MAX_WAVES);
+    }
+    const payload = JSON.stringify({
+      history: waves,
+      historyCount24h: orefState.historyCount24h,
+      totalHistoryCount: orefState.totalHistoryCount,
+      savedAt: new Date().toISOString(),
+    });
+    const tmpPath = OREF_LOCAL_FILE + '.tmp';
+    fs.writeFileSync(tmpPath, payload, 'utf8');
+    fs.renameSync(tmpPath, OREF_LOCAL_FILE);
+  } catch (err) {
+    console.warn('[Relay] OREF local file save error:', err.message);
+  }
+}
+
 async function orefBootstrapHistoryWithRetry() {
+  // Phase 0: local file (Railway volume — instant, no network)
+  if (OREF_LOCAL_FILE) {
+    const local = orefLoadLocalHistory();
+    if (local && local.length > 0) {
+      const cutoff24h = Date.now() - 24 * 60 * 60 * 1000;
+      orefState.history = local;
+      orefState.totalHistoryCount = local.reduce((sum, h) => {
+        return sum + h.alerts.reduce((s, a) => s + (Array.isArray(a.data) ? a.data.length : 1), 0);
+      }, 0);
+      orefState.historyCount24h = local
+        .filter(h => new Date(h.timestamp).getTime() > cutoff24h)
+        .reduce((sum, h) => sum + h.alerts.reduce((s, a) => s + (Array.isArray(a.data) ? a.data.length : 1), 0), 0);
+      const newest = local[local.length - 1];
+      orefState.lastAlertsJson = JSON.stringify(newest.alerts);
+      orefState.bootstrapSource = 'local-file';
+      console.log(`[Relay] OREF history loaded from local file: ${orefState.totalHistoryCount} records across ${local.length} waves`);
+      return;
+    }
+  }
+
   // Phase 1: try Redis first
   try {
     const cached = await upstashGet(OREF_REDIS_KEY);
@@ -785,13 +913,23 @@ function ucdpFetchPage(version, page) {
     const headers = { Accept: 'application/json', 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
     if (UCDP_ACCESS_TOKEN) headers['x-ucdp-access-token'] = UCDP_ACCESS_TOKEN;
     const req = https.request(pageUrl, { method: 'GET', headers, timeout: 30000 }, (resp) => {
+      if (resp.statusCode === 401 || resp.statusCode === 403) {
+        resp.resume();
+        return reject(new Error(`UCDP ${version} page ${page}: HTTP ${resp.statusCode} — API token required (set UCDP_ACCESS_TOKEN env var)`));
+      }
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
         resp.resume();
         return reject(new Error(`UCDP ${version} page ${page}: HTTP ${resp.statusCode}`));
       }
       let data = '';
       resp.on('data', (chunk) => { data += chunk; });
-      resp.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+      resp.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (typeof parsed === 'string') return reject(new Error(`UCDP ${version} page ${page}: ${parsed}`));
+          resolve(parsed);
+        } catch (e) { reject(e); }
+      });
     });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('UCDP timeout')); });
@@ -802,17 +940,18 @@ function ucdpFetchPage(version, page) {
 async function ucdpDiscoverVersion() {
   const year = new Date().getFullYear() - 2000;
   const candidates = [...new Set([`${year}.1`, `${year - 1}.1`, '25.1', '24.1'])];
-  const results = await Promise.allSettled(
-    candidates.map(async (v) => {
-      const p0 = await ucdpFetchPage(v, 0);
-      if (!Array.isArray(p0?.Result)) throw new Error('No results');
-      return { version: v, page0: p0 };
-    }),
-  );
-  for (const r of results) {
-    if (r.status === 'fulfilled') return r.value;
+  // Race all candidates — first valid result wins (avoids 30s hang on broken versions)
+  const attempts = candidates.map(async (v) => {
+    const p0 = await ucdpFetchPage(v, 0);
+    if (!Array.isArray(p0?.Result) || p0.Result.length === 0) throw new Error(`${v}: no results`);
+    return { version: v, page0: p0 };
+  });
+  try {
+    return await Promise.any(attempts);
+  } catch (aggErr) {
+    const reasons = aggErr.errors?.map(e => e?.message).join('; ') || aggErr.message;
+    throw new Error(`No valid UCDP GED version found (${reasons})`);
   }
-  throw new Error('No valid UCDP GED version found');
 }
 
 async function seedUcdpEvents() {
@@ -866,6 +1005,7 @@ async function seedUcdpEvents() {
 
     const payload = { events: mapped, fetchedAt: Date.now(), version, totalRaw: allEvents.length, filteredCount: mapped.length };
     const ok = await upstashSet(UCDP_REDIS_KEY, payload, UCDP_TTL_SECONDS);
+    await upstashSet('seed-meta:conflict:ucdp-events', { fetchedAt: Date.now(), recordCount: mapped.length }, 604800);
     console.log(`[UCDP] Seeded ${mapped.length} events (raw: ${allEvents.length}, failed pages: ${failedPages}, redis: ${ok ? 'OK' : 'FAIL'})`);
   } catch (e) {
     console.warn('[UCDP] Seed error:', e?.message || e);
@@ -884,6 +1024,2435 @@ async function startUcdpSeedLoop() {
   }, UCDP_POLL_INTERVAL_MS).unref?.();
 }
 
+// ─────────────────────────────────────────────────────────────
+// Satellite TLE Seed — CelesTrak NORAD elements → Redis
+// ─────────────────────────────────────────────────────────────
+const SAT_SEED_INTERVAL_MS = 7_200_000;
+const SAT_SEED_TTL = 14_400;
+const SAT_GROUPS = ['military', 'resource', 'active'];
+
+const SAT_NAME_FILTERS = [
+  /^YAOGAN/i, /^GAOFEN/i, /^JILIN/i,
+  /^COSMOS 2[4-9]\d{2}/i,
+  /^COSMO-SKYMED/i, /^TERRASAR/i, /^PAZ$/i, /^SAR-LUPE/i,
+  /^WORLDVIEW/i, /^SKYSAT/i, /^PLEIADES/i, /^KOMPSAT/i,
+  /^SAPPHIRE/i, /^PRAETORIAN/i,
+  /^SENTINEL/i,
+  /^CARTOSAT/i,
+  /^GOKTURK/i, /^RASAT/i,
+  /^USA[ -]?\d/i,
+  /^ZIYUAN/i,
+];
+
+function satClassify(name) {
+  const n = name.toUpperCase();
+  let type = 'military';
+  if (/COSMO-SKYMED|TERRASAR|PAZ|SAR-LUPE|YAOGAN/i.test(n)) type = 'sar';
+  else if (/WORLDVIEW|SKYSAT|PLEIADES|KOMPSAT|GAOFEN|JILIN|CARTOSAT|ZIYUAN/i.test(n)) type = 'optical';
+  else if (/SAPPHIRE|PRAETORIAN|USA|GOKTURK/i.test(n)) type = 'military';
+
+  let country = 'OTHER';
+  if (/^YAOGAN|^GAOFEN|^JILIN|^ZIYUAN/i.test(n)) country = 'CN';
+  else if (/^COSMOS/i.test(n)) country = 'RU';
+  else if (/^WORLDVIEW|^SAPPHIRE|^PRAETORIAN|^USA|^SKYSAT/i.test(n)) country = 'US';
+  else if (/^SENTINEL|^COSMO-SKYMED|^TERRASAR|^SAR-LUPE|^PAZ|^PLEIADES/i.test(n)) country = 'EU';
+  else if (/^KOMPSAT/i.test(n)) country = 'KR';
+  else if (/^CARTOSAT/i.test(n)) country = 'IN';
+  else if (/^GOKTURK|^RASAT/i.test(n)) country = 'TR';
+
+  return { type, country };
+}
+
+let satSeedInFlight = false;
+
+async function seedSatelliteTLEs() {
+  if (satSeedInFlight) return;
+  satSeedInFlight = true;
+  const t0 = Date.now();
+  try {
+    const byNorad = new Map();
+
+    for (const group of SAT_GROUPS) {
+      let text;
+      try {
+        text = await new Promise((resolve, reject) => {
+          const url = new URL(`https://celestrak.org/NORAD/elements/gp.php?GROUP=${group}&FORMAT=tle`);
+          const req = https.request(url, { method: 'GET', headers: { 'User-Agent': CHROME_UA }, timeout: 15000 }, (resp) => {
+            if (resp.statusCode < 200 || resp.statusCode >= 300) {
+              resp.resume();
+              return reject(new Error(`CelesTrak ${group}: HTTP ${resp.statusCode}`));
+            }
+            let data = '';
+            let size = 0;
+            resp.on('data', (chunk) => {
+              size += chunk.length;
+              if (size > 2 * 1024 * 1024) { req.destroy(); return reject(new Error(`CelesTrak ${group}: payload > 2MB`)); }
+              data += chunk;
+            });
+            resp.on('end', () => resolve(data));
+          });
+          req.on('error', reject);
+          req.on('timeout', () => { req.destroy(); reject(new Error(`CelesTrak ${group}: timeout`)); });
+          req.end();
+        });
+      } catch (e) {
+        console.warn(`[Satellites] Skipping group ${group}:`, e?.message || e);
+        continue;
+      }
+
+      const lines = text.split('\n').map(l => l.trimEnd());
+      for (let i = 0; i < lines.length - 2; i++) {
+        const l1 = lines[i + 1];
+        const l2 = lines[i + 2];
+        if (!l1.startsWith('1 ') || !l2.startsWith('2 ')) continue;
+        if (l1.length !== 69 || l2.length !== 69) continue;
+        const name = lines[i].trim();
+        const noradId = l1.substring(2, 7).trim();
+        if (!byNorad.has(noradId)) {
+          byNorad.set(noradId, { noradId, name, line1: l1, line2: l2 });
+        }
+        i += 2;
+      }
+    }
+
+    const satellites = [];
+    for (const sat of byNorad.values()) {
+      if (!SAT_NAME_FILTERS.some(rx => rx.test(sat.name))) continue;
+      const { type, country } = satClassify(sat.name);
+      satellites.push({ ...sat, type, country });
+    }
+
+    if (satellites.length === 0) {
+      console.warn('[Satellites] No matching TLEs found — skipping write');
+      return;
+    }
+
+    const payload = { satellites, fetchedAt: Date.now() };
+    const ok = await upstashSet('intelligence:satellites:tle:v1', payload, SAT_SEED_TTL);
+    await upstashSet('seed-meta:intelligence:satellites', { fetchedAt: Date.now(), recordCount: satellites.length }, 604800);
+    console.log(`[Satellites] Seeded ${satellites.length} TLEs (redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[Satellites] Seed error:', e?.message || e);
+  } finally {
+    satSeedInFlight = false;
+  }
+}
+
+async function startSatelliteSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[Satellites] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[Satellites] Seed loop starting (interval ${SAT_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedSatelliteTLEs().catch(e => console.warn('[Satellites] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedSatelliteTLEs().catch(e => console.warn('[Satellites] Seed error:', e?.message || e));
+  }, SAT_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Market Data Seed — Railway fetches Yahoo/Finnhub → writes to Redis
+// so Vercel handlers serve from cache (avoids Yahoo 429 from Vercel IPs)
+// ─────────────────────────────────────────────────────────────
+const FINNHUB_API_KEY = process.env.FINNHUB_API_KEY || '';
+const MARKET_SEED_INTERVAL_MS = 300_000; // 5 min
+const MARKET_SEED_TTL = 1800; // 30 min — survives 5 missed cycles
+
+// Must match src/config/markets.ts MARKET_SYMBOLS — update both when changing
+const MARKET_SYMBOLS = [
+  'AAPL', 'AMZN', 'AVGO', 'BAC', 'BRK-B', 'COST', 'GOOGL', 'HD',
+  'JNJ', 'JPM', 'LLY', 'MA', 'META', 'MSFT', 'NFLX', 'NVO', 'NVDA',
+  'ORCL', 'PG', 'TSLA', 'TSM', 'UNH', 'V', 'WMT', 'XOM',
+  '^DJI', '^GSPC', '^IXIC',
+];
+
+const COMMODITY_SYMBOLS = ['^VIX', 'GC=F', 'CL=F', 'NG=F', 'SI=F', 'HG=F'];
+
+const SECTOR_SYMBOLS = ['XLK', 'XLF', 'XLE', 'XLV', 'XLY', 'XLI', 'XLP', 'XLU', 'XLB', 'XLRE', 'XLC', 'SMH'];
+
+const YAHOO_ONLY = new Set(['^GSPC', '^DJI', '^IXIC', '^VIX', 'GC=F', 'CL=F', 'NG=F', 'SI=F', 'HG=F']);
+
+function fetchYahooChartDirect(symbol) {
+  return new Promise((resolve) => {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}`;
+    const req = https.get(url, {
+      headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' },
+      timeout: 10000,
+    }, (resp) => {
+      if (resp.statusCode !== 200) {
+        resp.resume();
+        logThrottled('warn', `market-yahoo-${resp.statusCode}:${symbol}`, `[Market] Yahoo ${symbol} HTTP ${resp.statusCode}`);
+        return resolve(null);
+      }
+      let body = '';
+      resp.on('data', (chunk) => { body += chunk; });
+      resp.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          const result = data?.chart?.result?.[0];
+          const meta = result?.meta;
+          if (!meta) return resolve(null);
+          const price = meta.regularMarketPrice;
+          const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+          const change = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
+          const closes = result.indicators?.quote?.[0]?.close;
+          const sparkline = Array.isArray(closes) ? closes.filter((v) => v != null) : [];
+          resolve({ price, change, sparkline });
+        } catch { resolve(null); }
+      });
+    });
+    req.on('error', (err) => { logThrottled('warn', `market-yahoo-err:${symbol}`, `[Market] Yahoo ${symbol} error: ${err.message}`); resolve(null); });
+    req.on('timeout', () => { req.destroy(); logThrottled('warn', `market-yahoo-timeout:${symbol}`, `[Market] Yahoo ${symbol} timeout`); resolve(null); });
+  });
+}
+
+function fetchFinnhubQuoteDirect(symbol, apiKey) {
+  return new Promise((resolve) => {
+    const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(symbol)}`;
+    const req = https.get(url, {
+      headers: { 'User-Agent': CHROME_UA, Accept: 'application/json', 'X-Finnhub-Token': apiKey },
+      timeout: 10000,
+    }, (resp) => {
+      if (resp.statusCode !== 200) {
+        resp.resume();
+        return resolve(null);
+      }
+      let body = '';
+      resp.on('data', (chunk) => { body += chunk; });
+      resp.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (data.c === 0 && data.h === 0 && data.l === 0) return resolve(null);
+          resolve({ price: data.c, changePercent: data.dp });
+        } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+async function seedMarketQuotes() {
+  const quotes = [];
+  const finnhubSymbols = MARKET_SYMBOLS.filter((s) => !YAHOO_ONLY.has(s));
+  const yahooSymbols = MARKET_SYMBOLS.filter((s) => YAHOO_ONLY.has(s));
+
+  if (FINNHUB_API_KEY && finnhubSymbols.length > 0) {
+    const results = await Promise.all(finnhubSymbols.map((s) => fetchFinnhubQuoteDirect(s, FINNHUB_API_KEY)));
+    for (let i = 0; i < finnhubSymbols.length; i++) {
+      const r = results[i];
+      if (r) quotes.push({ symbol: finnhubSymbols[i], name: finnhubSymbols[i], display: finnhubSymbols[i], price: r.price, change: r.changePercent, sparkline: [] });
+    }
+  }
+
+  const missedFinnhub = FINNHUB_API_KEY
+    ? finnhubSymbols.filter((s) => !quotes.some((q) => q.symbol === s))
+    : finnhubSymbols;
+  const allYahoo = [...yahooSymbols, ...missedFinnhub];
+
+  for (const s of allYahoo) {
+    if (quotes.some((q) => q.symbol === s)) continue;
+    const yahoo = await fetchYahooChartDirect(s);
+    if (yahoo) quotes.push({ symbol: s, name: s, display: s, price: yahoo.price, change: yahoo.change, sparkline: yahoo.sparkline });
+    await sleep(150);
+  }
+
+  if (quotes.length === 0) {
+    console.warn('[Market] No quotes fetched — skipping Redis write');
+    return 0;
+  }
+
+  const coveredByYahoo = finnhubSymbols.every((s) => quotes.some((q) => q.symbol === s));
+  const skipped = !FINNHUB_API_KEY && !coveredByYahoo;
+  const payload = { quotes, finnhubSkipped: skipped, skipReason: skipped ? 'FINNHUB_API_KEY not configured' : '', rateLimited: false };
+  const redisKey = `market:quotes:v1:${[...MARKET_SYMBOLS].sort().join(',')}`;
+  const ok = await upstashSet(redisKey, payload, MARKET_SEED_TTL);
+  // Bootstrap-friendly fixed key — frontend hydrates from /api/bootstrap without RPC
+  const ok2 = await upstashSet('market:stocks-bootstrap:v1', payload, MARKET_SEED_TTL);
+  const ok3 = await upstashSet('seed-meta:market:stocks', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
+  console.log(`[Market] Seeded ${quotes.length}/${MARKET_SYMBOLS.length} quotes (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
+  return quotes.length;
+}
+
+async function seedCommodityQuotes() {
+  const quotes = [];
+  for (const s of COMMODITY_SYMBOLS) {
+    const yahoo = await fetchYahooChartDirect(s);
+    if (yahoo) quotes.push({ symbol: s, name: s, display: s, price: yahoo.price, change: yahoo.change, sparkline: yahoo.sparkline });
+    await sleep(150);
+  }
+
+  if (quotes.length === 0) {
+    console.warn('[Market] No commodity quotes fetched — skipping Redis write');
+    return 0;
+  }
+
+  const payload = { quotes };
+  const redisKey = `market:commodities:v1:${[...COMMODITY_SYMBOLS].sort().join(',')}`;
+  const ok = await upstashSet(redisKey, payload, MARKET_SEED_TTL);
+  // Also write under market:quotes:v1: key — the frontend routes commodities through
+  // listMarketQuotes RPC, which constructs this key pattern (not market:commodities:v1:)
+  const quotesKey = `market:quotes:v1:${[...COMMODITY_SYMBOLS].sort().join(',')}`;
+  const quotesPayload = { quotes, finnhubSkipped: false, skipReason: '', rateLimited: false };
+  const ok2 = await upstashSet(quotesKey, quotesPayload, MARKET_SEED_TTL);
+  // Bootstrap-friendly fixed key — frontend hydrates from /api/bootstrap without RPC
+  const ok3 = await upstashSet('market:commodities-bootstrap:v1', quotesPayload, MARKET_SEED_TTL);
+  const ok4 = await upstashSet('seed-meta:market:commodities', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
+  console.log(`[Market] Seeded ${quotes.length}/${COMMODITY_SYMBOLS.length} commodities (redis: ${ok && ok2 && ok3 && ok4 ? 'OK' : 'PARTIAL'})`);
+  return quotes.length;
+}
+
+async function seedSectorSummary() {
+  const sectors = [];
+
+  if (FINNHUB_API_KEY) {
+    const results = await Promise.all(SECTOR_SYMBOLS.map((s) => fetchFinnhubQuoteDirect(s, FINNHUB_API_KEY)));
+    for (let i = 0; i < SECTOR_SYMBOLS.length; i++) {
+      const r = results[i];
+      if (r) sectors.push({ symbol: SECTOR_SYMBOLS[i], name: SECTOR_SYMBOLS[i], change: r.changePercent });
+    }
+  }
+
+  if (sectors.length === 0) {
+    for (const s of SECTOR_SYMBOLS) {
+      const yahoo = await fetchYahooChartDirect(s);
+      if (yahoo) sectors.push({ symbol: s, name: s, change: yahoo.change });
+      await sleep(150);
+    }
+  }
+
+  if (sectors.length === 0) {
+    console.warn('[Market] No sector data fetched — skipping Redis write');
+    return 0;
+  }
+
+  const payload = { sectors };
+  const ok = await upstashSet('market:sectors:v1', payload, MARKET_SEED_TTL);
+  // Also write under market:quotes:v1: key — the frontend routes sectors through
+  // fetchMultipleStocks → listMarketQuotes RPC, which constructs this key pattern
+  const quotesKey = `market:quotes:v1:${[...SECTOR_SYMBOLS].sort().join(',')}`;
+  const sectorQuotes = sectors.map((s) => ({
+    symbol: s.symbol, name: s.name, display: s.name,
+    price: 0, change: s.change, sparkline: [],
+  }));
+  const quotesPayload = { quotes: sectorQuotes, finnhubSkipped: false, skipReason: '', rateLimited: false };
+  const ok2 = await upstashSet(quotesKey, quotesPayload, MARKET_SEED_TTL);
+  const ok3 = await upstashSet('seed-meta:market:sectors', { fetchedAt: Date.now(), recordCount: sectors.length }, 604800);
+  console.log(`[Market] Seeded ${sectors.length}/${SECTOR_SYMBOLS.length} sectors (redis: ${ok && ok2 && ok3 ? 'OK' : 'PARTIAL'})`);
+  return sectors.length;
+}
+
+// Gulf Quotes — Yahoo Finance (14 symbols: indices, currencies, oil)
+const GULF_SYMBOLS = [
+  { symbol: '^TASI.SR', name: 'Tadawul All Share', country: 'Saudi Arabia', flag: '\u{1F1F8}\u{1F1E6}', type: 'index' },
+  { symbol: 'DFMGI.AE', name: 'Dubai Financial Market', country: 'UAE', flag: '\u{1F1E6}\u{1F1EA}', type: 'index' },
+  { symbol: 'UAE', name: 'Abu Dhabi (iShares)', country: 'UAE', flag: '\u{1F1E6}\u{1F1EA}', type: 'index' },
+  { symbol: 'QAT', name: 'Qatar (iShares)', country: 'Qatar', flag: '\u{1F1F6}\u{1F1E6}', type: 'index' },
+  { symbol: 'GULF', name: 'Gulf Dividend (WisdomTree)', country: 'Kuwait', flag: '\u{1F1F0}\u{1F1FC}', type: 'index' },
+  { symbol: '^MSM', name: 'Muscat MSM 30', country: 'Oman', flag: '\u{1F1F4}\u{1F1F2}', type: 'index' },
+  { symbol: 'SARUSD=X', name: 'Saudi Riyal', country: 'Saudi Arabia', flag: '\u{1F1F8}\u{1F1E6}', type: 'currency' },
+  { symbol: 'AEDUSD=X', name: 'UAE Dirham', country: 'UAE', flag: '\u{1F1E6}\u{1F1EA}', type: 'currency' },
+  { symbol: 'QARUSD=X', name: 'Qatari Riyal', country: 'Qatar', flag: '\u{1F1F6}\u{1F1E6}', type: 'currency' },
+  { symbol: 'KWDUSD=X', name: 'Kuwaiti Dinar', country: 'Kuwait', flag: '\u{1F1F0}\u{1F1FC}', type: 'currency' },
+  { symbol: 'BHDUSD=X', name: 'Bahraini Dinar', country: 'Bahrain', flag: '\u{1F1E7}\u{1F1ED}', type: 'currency' },
+  { symbol: 'OMRUSD=X', name: 'Omani Rial', country: 'Oman', flag: '\u{1F1F4}\u{1F1F2}', type: 'currency' },
+  { symbol: 'CL=F', name: 'WTI Crude', country: '', flag: '\u{1F6E2}\u{FE0F}', type: 'oil' },
+  { symbol: 'BZ=F', name: 'Brent Crude', country: '', flag: '\u{1F6E2}\u{FE0F}', type: 'oil' },
+];
+const GULF_SEED_TTL = 5400; // 90min — survives 1 missed cycle
+
+async function seedGulfQuotes() {
+  const quotes = [];
+  for (const meta of GULF_SYMBOLS) {
+    const yahoo = await fetchYahooChartDirect(meta.symbol);
+    if (yahoo) {
+      quotes.push({
+        symbol: meta.symbol, name: meta.name, country: meta.country,
+        flag: meta.flag, type: meta.type,
+        price: yahoo.price, change: +(yahoo.change).toFixed(2), sparkline: yahoo.sparkline,
+      });
+    }
+    await sleep(150);
+  }
+  if (quotes.length === 0) { console.warn('[Gulf] No quotes fetched — skipping'); return 0; }
+  const payload = { quotes, rateLimited: false };
+  const ok1 = await upstashSet('market:gulf-quotes:v1', payload, GULF_SEED_TTL);
+  const ok2 = await upstashSet('seed-meta:market:gulf-quotes', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
+  console.log(`[Gulf] Seeded ${quotes.length}/${GULF_SYMBOLS.length} quotes (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
+  return quotes.length;
+}
+
+// ETF Flows — Yahoo Finance (10 BTC spot ETFs)
+const ETF_LIST = [
+  { ticker: 'IBIT', issuer: 'BlackRock' }, { ticker: 'FBTC', issuer: 'Fidelity' },
+  { ticker: 'ARKB', issuer: 'ARK/21Shares' }, { ticker: 'BITB', issuer: 'Bitwise' },
+  { ticker: 'GBTC', issuer: 'Grayscale' }, { ticker: 'HODL', issuer: 'VanEck' },
+  { ticker: 'BRRR', issuer: 'Valkyrie' }, { ticker: 'EZBC', issuer: 'Franklin' },
+  { ticker: 'BTCO', issuer: 'Invesco' }, { ticker: 'BTCW', issuer: 'WisdomTree' },
+];
+const ETF_SEED_TTL = 5400; // 90min
+
+function parseEtfChart(chart, ticker, issuer) {
+  const result = chart?.chart?.result?.[0];
+  if (!result) return null;
+  const closes = (result.indicators?.quote?.[0]?.close || []).filter((v) => v != null);
+  const volumes = (result.indicators?.quote?.[0]?.volume || []).filter((v) => v != null);
+  if (closes.length < 2) return null;
+  const price = closes[closes.length - 1];
+  const prev = closes[closes.length - 2];
+  const priceChange = prev ? ((price - prev) / prev) * 100 : 0;
+  const vol = volumes.length > 0 ? volumes[volumes.length - 1] : 0;
+  const avgVol = volumes.length > 1 ? volumes.slice(0, -1).reduce((a, b) => a + b, 0) / (volumes.length - 1) : vol;
+  const volumeRatio = avgVol > 0 ? vol / avgVol : 1;
+  const direction = priceChange > 0.1 ? 'inflow' : priceChange < -0.1 ? 'outflow' : 'neutral';
+  return { ticker, issuer, price: +price.toFixed(2), priceChange: +priceChange.toFixed(2), volume: vol, avgVolume: Math.round(avgVol), volumeRatio: +volumeRatio.toFixed(2), direction, estFlow: Math.round(vol * price * (priceChange > 0 ? 1 : -1) * 0.1) };
+}
+
+async function seedEtfFlows() {
+  const etfs = [];
+  for (const { ticker, issuer } of ETF_LIST) {
+    try {
+      const raw = await new Promise((resolve) => {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=5d&interval=1d`;
+        const req = https.get(url, { headers: { 'User-Agent': CHROME_UA, Accept: 'application/json' }, timeout: 10000 }, (resp) => {
+          if (resp.statusCode !== 200) { resp.resume(); return resolve(null); }
+          let body = '';
+          resp.on('data', (chunk) => { body += chunk; });
+          resp.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve(null); } });
+        });
+        req.on('error', () => resolve(null));
+        req.on('timeout', () => { req.destroy(); resolve(null); });
+      });
+      const parsed = raw ? parseEtfChart(raw, ticker, issuer) : null;
+      if (parsed) etfs.push(parsed);
+    } catch {}
+    await sleep(150);
+  }
+  if (etfs.length === 0) { console.warn('[ETF] No data fetched — skipping'); return 0; }
+  const totalVolume = etfs.reduce((s, e) => s + e.volume, 0);
+  const totalEstFlow = etfs.reduce((s, e) => s + e.estFlow, 0);
+  const payload = {
+    timestamp: new Date().toISOString(),
+    summary: { etfCount: etfs.length, totalVolume, totalEstFlow, netDirection: totalEstFlow > 0 ? 'NET INFLOW' : totalEstFlow < 0 ? 'NET OUTFLOW' : 'NEUTRAL', inflowCount: etfs.filter((e) => e.direction === 'inflow').length, outflowCount: etfs.filter((e) => e.direction === 'outflow').length },
+    etfs, rateLimited: false,
+  };
+  const ok1 = await upstashSet('market:etf-flows:v1', payload, ETF_SEED_TTL);
+  const ok2 = await upstashSet('seed-meta:market:etf-flows', { fetchedAt: Date.now(), recordCount: etfs.length }, 604800);
+  console.log(`[ETF] Seeded ${etfs.length}/${ETF_LIST.length} ETFs (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
+  return etfs.length;
+}
+
+// Crypto Quotes — CoinGecko → CoinPaprika fallback
+const _cryptoCfg = requireShared('crypto.json');
+const CRYPTO_IDS = _cryptoCfg.ids;
+const CRYPTO_META = _cryptoCfg.meta;
+const CRYPTO_PAPRIKA_MAP = _cryptoCfg.coinpaprika;
+const CRYPTO_SEED_TTL = 3600; // 1h
+
+async function fetchCryptoCoinPaprika() {
+  const data = await cyberHttpGetJson('https://api.coinpaprika.com/v1/tickers?quotes=USD', { Accept: 'application/json' }, 15000);
+  if (!Array.isArray(data)) throw new Error('CoinPaprika returned non-array');
+  const paprikaIds = new Set(CRYPTO_IDS.map((id) => CRYPTO_PAPRIKA_MAP[id]).filter(Boolean));
+  const reverseMap = Object.fromEntries(Object.entries(CRYPTO_PAPRIKA_MAP).map(([g, p]) => [p, g]));
+  return data.filter((t) => paprikaIds.has(t.id)).map((t) => ({
+    id: reverseMap[t.id] || t.id, current_price: t.quotes.USD.price,
+    price_change_percentage_24h: t.quotes.USD.percent_change_24h,
+    sparkline_in_7d: undefined, symbol: t.symbol.toLowerCase(), name: t.name,
+  }));
+}
+
+async function seedCryptoQuotes() {
+  let data;
+  try {
+    const apiKey = process.env.COINGECKO_API_KEY;
+    const base = apiKey ? 'https://pro-api.coingecko.com/api/v3' : 'https://api.coingecko.com/api/v3';
+    const headers = { Accept: 'application/json' };
+    if (apiKey) headers['x-cg-pro-api-key'] = apiKey;
+    const url = `${base}/coins/markets?vs_currency=usd&ids=${CRYPTO_IDS.join(',')}&order=market_cap_desc&sparkline=true&price_change_percentage=24h`;
+    data = await cyberHttpGetJson(url, headers, 15000);
+    if (!Array.isArray(data) || data.length === 0) throw new Error('CoinGecko returned no data');
+  } catch (err) {
+    console.warn(`[Crypto] CoinGecko failed: ${err.message} — trying CoinPaprika`);
+    try { data = await fetchCryptoCoinPaprika(); } catch (e2) { console.warn(`[Crypto] CoinPaprika also failed: ${e2.message} — skipping`); return 0; }
+  }
+  const quotes = [];
+  for (const id of CRYPTO_IDS) {
+    const coin = data.find((c) => c.id === id);
+    if (!coin) continue;
+    const meta = CRYPTO_META[id];
+    const prices = coin.sparkline_in_7d?.price;
+    quotes.push({ name: meta?.name || id, symbol: meta?.symbol || id.toUpperCase(), price: coin.current_price ?? 0, change: coin.price_change_percentage_24h ?? 0, sparkline: prices && prices.length > 24 ? prices.slice(-48) : (prices || []) });
+  }
+  if (quotes.length === 0 || quotes.every((q) => q.price === 0)) { console.warn('[Crypto] No valid quotes — skipping'); return 0; }
+  const ok1 = await upstashSet('market:crypto:v1', { quotes }, CRYPTO_SEED_TTL);
+  const ok2 = await upstashSet('seed-meta:market:crypto', { fetchedAt: Date.now(), recordCount: quotes.length }, 604800);
+  console.log(`[Crypto] Seeded ${quotes.length}/${CRYPTO_IDS.length} quotes (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
+  return quotes.length;
+}
+
+// Stablecoin Markets — CoinGecko → CoinPaprika fallback
+const STABLECOIN_IDS = 'tether,usd-coin,dai,first-digital-usd,ethena-usde';
+const STABLECOIN_PAPRIKA_MAP = { tether: 'usdt-tether', 'usd-coin': 'usdc-usd-coin', dai: 'dai-dai', 'first-digital-usd': 'fdusd-first-digital-usd', 'ethena-usde': 'usde-ethena-usde' };
+const STABLECOIN_SEED_TTL = 3600; // 1h
+
+async function fetchStablecoinCoinPaprika() {
+  const data = await cyberHttpGetJson('https://api.coinpaprika.com/v1/tickers?quotes=USD', { Accept: 'application/json' }, 15000);
+  if (!Array.isArray(data)) throw new Error('CoinPaprika returned non-array');
+  const ids = STABLECOIN_IDS.split(',');
+  const paprikaIds = new Set(ids.map((id) => STABLECOIN_PAPRIKA_MAP[id]).filter(Boolean));
+  const reverseMap = Object.fromEntries(Object.entries(STABLECOIN_PAPRIKA_MAP).map(([g, p]) => [p, g]));
+  return data.filter((t) => paprikaIds.has(t.id)).map((t) => ({
+    id: reverseMap[t.id] || t.id, current_price: t.quotes.USD.price,
+    price_change_percentage_24h: t.quotes.USD.percent_change_24h,
+    price_change_percentage_7d_in_currency: t.quotes.USD.percent_change_7d,
+    market_cap: t.quotes.USD.market_cap, total_volume: t.quotes.USD.volume_24h,
+    symbol: t.symbol.toLowerCase(), name: t.name, image: '',
+  }));
+}
+
+async function seedStablecoinMarkets() {
+  let data;
+  try {
+    const apiKey = process.env.COINGECKO_API_KEY;
+    const base = apiKey ? 'https://pro-api.coingecko.com/api/v3' : 'https://api.coingecko.com/api/v3';
+    const headers = { Accept: 'application/json' };
+    if (apiKey) headers['x-cg-pro-api-key'] = apiKey;
+    const url = `${base}/coins/markets?vs_currency=usd&ids=${STABLECOIN_IDS}&order=market_cap_desc&sparkline=false&price_change_percentage=7d`;
+    data = await cyberHttpGetJson(url, headers, 15000);
+    if (!Array.isArray(data) || data.length === 0) throw new Error('CoinGecko returned no data');
+  } catch (err) {
+    console.warn(`[Stablecoin] CoinGecko failed: ${err.message} — trying CoinPaprika`);
+    try { data = await fetchStablecoinCoinPaprika(); } catch (e2) { console.warn(`[Stablecoin] CoinPaprika also failed: ${e2.message} — skipping`); return 0; }
+  }
+  const stablecoins = data.map((coin) => {
+    const price = coin.current_price || 0;
+    const deviation = Math.abs(price - 1.0);
+    const pegStatus = deviation <= 0.005 ? 'ON PEG' : deviation <= 0.01 ? 'SLIGHT DEPEG' : 'DEPEGGED';
+    return { id: coin.id, symbol: (coin.symbol || '').toUpperCase(), name: coin.name, price, deviation: +(deviation * 100).toFixed(3), pegStatus, marketCap: coin.market_cap || 0, volume24h: coin.total_volume || 0, change24h: coin.price_change_percentage_24h || 0, change7d: coin.price_change_percentage_7d_in_currency || 0, image: coin.image || '' };
+  });
+  const totalMarketCap = stablecoins.reduce((s, c) => s + c.marketCap, 0);
+  const totalVolume24h = stablecoins.reduce((s, c) => s + c.volume24h, 0);
+  const depeggedCount = stablecoins.filter((c) => c.pegStatus === 'DEPEGGED').length;
+  const payload = { timestamp: new Date().toISOString(), summary: { totalMarketCap, totalVolume24h, coinCount: stablecoins.length, depeggedCount, healthStatus: depeggedCount === 0 ? 'HEALTHY' : depeggedCount === 1 ? 'CAUTION' : 'WARNING' }, stablecoins };
+  const ok1 = await upstashSet('market:stablecoins:v1', payload, STABLECOIN_SEED_TTL);
+  const ok2 = await upstashSet('seed-meta:market:stablecoins', { fetchedAt: Date.now(), recordCount: stablecoins.length }, 604800);
+  console.log(`[Stablecoin] Seeded ${stablecoins.length} coins (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'})`);
+  return stablecoins.length;
+}
+
+async function seedAllMarketData() {
+  const t0 = Date.now();
+  const q = await seedMarketQuotes();
+  const c = await seedCommodityQuotes();
+  const s = await seedSectorSummary();
+  const g = await seedGulfQuotes();
+  const e = await seedEtfFlows();
+  const cr = await seedCryptoQuotes();
+  const sc = await seedStablecoinMarkets();
+  console.log(`[Market] Seed complete: ${q} quotes, ${c} commodities, ${s} sectors, ${g} gulf, ${e} etf, ${cr} crypto, ${sc} stablecoins (${((Date.now() - t0) / 1000).toFixed(1)}s)`);
+}
+
+async function startMarketDataSeedLoop() {
+  if (process.env.DISABLE_RELAY_MARKET_SEED) {
+    console.log('[Market] Relay market seeding disabled via DISABLE_RELAY_MARKET_SEED');
+    return;
+  }
+  if (!UPSTASH_ENABLED) {
+    console.log('[Market] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[Market] Seed loop starting (interval ${MARKET_SEED_INTERVAL_MS / 1000 / 60}min, finnhub: ${FINNHUB_API_KEY ? 'yes' : 'no'})`);
+  seedAllMarketData().catch((e) => console.warn('[Market] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedAllMarketData().catch((e) => console.warn('[Market] Seed error:', e?.message || e));
+  }, MARKET_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Aviation Seed — Railway fetches AviationStack → writes to Redis
+// so Vercel handler serves from cache (avoids 114 API calls per miss)
+// ─────────────────────────────────────────────────────────────
+const AVIATIONSTACK_API_KEY = process.env.AVIATIONSTACK_API || '';
+const AVIATION_SEED_INTERVAL_MS = 30 * 60 * 1000; // 30min
+const AVIATION_SEED_TTL = 3600; // 1h — survives 1 missed cycle
+const AVIATION_REDIS_KEY = 'aviation:delays:intl:v3';
+const AVIATION_BATCH_CONCURRENCY = 10;
+const AVIATION_MIN_FLIGHTS_FOR_CLOSURE = 10;
+const RESOLVED_STATUSES = new Set(['cancelled', 'landed', 'active', 'arrived', 'diverted']);
+
+// Must match src/config/airports.ts AVIATIONSTACK_AIRPORTS — update both when changing
+const AVIATIONSTACK_AIRPORTS = [
+  'YYZ', 'YVR', 'MEX', 'GRU', 'EZE', 'BOG', 'SCL',
+  'LHR', 'CDG', 'FRA', 'AMS', 'MAD', 'FCO', 'MUC', 'BCN', 'ZRH', 'IST', 'VIE', 'CPH',
+  'DUB', 'LIS', 'ATH', 'WAW',
+  'HND', 'NRT', 'PEK', 'PVG', 'HKG', 'SIN', 'ICN', 'BKK', 'SYD', 'DEL', 'BOM', 'KUL',
+  'CAN', 'TPE', 'MNL',
+  'DXB', 'DOH', 'AUH', 'RUH', 'CAI', 'TLV', 'AMM', 'KWI', 'CMN',
+  'JNB', 'NBO', 'LOS', 'ADD', 'CPT',
+];
+
+// Airport metadata needed for alert construction (inlined from airports.ts)
+const AIRPORT_META = {
+  YYZ: { icao: 'CYYZ', name: 'Toronto Pearson', city: 'Toronto', country: 'Canada', lat: 43.6777, lon: -79.6248, region: 'americas' },
+  MEX: { icao: 'MMMX', name: 'Mexico City International', city: 'Mexico City', country: 'Mexico', lat: 19.4363, lon: -99.0721, region: 'americas' },
+  GRU: { icao: 'SBGR', name: 'São Paulo–Guarulhos', city: 'São Paulo', country: 'Brazil', lat: -23.4356, lon: -46.4731, region: 'americas' },
+  EZE: { icao: 'SAEZ', name: 'Ministro Pistarini', city: 'Buenos Aires', country: 'Argentina', lat: -34.8222, lon: -58.5358, region: 'americas' },
+  BOG: { icao: 'SKBO', name: 'El Dorado International', city: 'Bogotá', country: 'Colombia', lat: 4.7016, lon: -74.1469, region: 'americas' },
+  LHR: { icao: 'EGLL', name: 'London Heathrow', city: 'London', country: 'UK', lat: 51.4700, lon: -0.4543, region: 'europe' },
+  CDG: { icao: 'LFPG', name: 'Paris Charles de Gaulle', city: 'Paris', country: 'France', lat: 49.0097, lon: 2.5479, region: 'europe' },
+  FRA: { icao: 'EDDF', name: 'Frankfurt Airport', city: 'Frankfurt', country: 'Germany', lat: 50.0379, lon: 8.5622, region: 'europe' },
+  AMS: { icao: 'EHAM', name: 'Amsterdam Schiphol', city: 'Amsterdam', country: 'Netherlands', lat: 52.3105, lon: 4.7683, region: 'europe' },
+  MAD: { icao: 'LEMD', name: 'Adolfo Suárez Madrid–Barajas', city: 'Madrid', country: 'Spain', lat: 40.4983, lon: -3.5676, region: 'europe' },
+  FCO: { icao: 'LIRF', name: 'Leonardo da Vinci–Fiumicino', city: 'Rome', country: 'Italy', lat: 41.8003, lon: 12.2389, region: 'europe' },
+  MUC: { icao: 'EDDM', name: 'Munich Airport', city: 'Munich', country: 'Germany', lat: 48.3537, lon: 11.7750, region: 'europe' },
+  BCN: { icao: 'LEBL', name: 'Barcelona–El Prat', city: 'Barcelona', country: 'Spain', lat: 41.2974, lon: 2.0833, region: 'europe' },
+  ZRH: { icao: 'LSZH', name: 'Zurich Airport', city: 'Zurich', country: 'Switzerland', lat: 47.4647, lon: 8.5492, region: 'europe' },
+  IST: { icao: 'LTFM', name: 'Istanbul Airport', city: 'Istanbul', country: 'Turkey', lat: 41.2753, lon: 28.7519, region: 'europe' },
+  VIE: { icao: 'LOWW', name: 'Vienna International', city: 'Vienna', country: 'Austria', lat: 48.1103, lon: 16.5697, region: 'europe' },
+  CPH: { icao: 'EKCH', name: 'Copenhagen Airport', city: 'Copenhagen', country: 'Denmark', lat: 55.6180, lon: 12.6508, region: 'europe' },
+  HND: { icao: 'RJTT', name: 'Tokyo Haneda', city: 'Tokyo', country: 'Japan', lat: 35.5494, lon: 139.7798, region: 'apac' },
+  NRT: { icao: 'RJAA', name: 'Narita International', city: 'Tokyo', country: 'Japan', lat: 35.7720, lon: 140.3929, region: 'apac' },
+  PEK: { icao: 'ZBAA', name: 'Beijing Capital', city: 'Beijing', country: 'China', lat: 40.0799, lon: 116.6031, region: 'apac' },
+  PVG: { icao: 'ZSPD', name: 'Shanghai Pudong', city: 'Shanghai', country: 'China', lat: 31.1443, lon: 121.8083, region: 'apac' },
+  HKG: { icao: 'VHHH', name: 'Hong Kong International', city: 'Hong Kong', country: 'China', lat: 22.3080, lon: 113.9185, region: 'apac' },
+  SIN: { icao: 'WSSS', name: 'Singapore Changi', city: 'Singapore', country: 'Singapore', lat: 1.3644, lon: 103.9915, region: 'apac' },
+  ICN: { icao: 'RKSI', name: 'Incheon International', city: 'Seoul', country: 'South Korea', lat: 37.4602, lon: 126.4407, region: 'apac' },
+  BKK: { icao: 'VTBS', name: 'Suvarnabhumi Airport', city: 'Bangkok', country: 'Thailand', lat: 13.6900, lon: 100.7501, region: 'apac' },
+  SYD: { icao: 'YSSY', name: 'Sydney Kingsford Smith', city: 'Sydney', country: 'Australia', lat: -33.9461, lon: 151.1772, region: 'apac' },
+  DEL: { icao: 'VIDP', name: 'Indira Gandhi International', city: 'Delhi', country: 'India', lat: 28.5562, lon: 77.1000, region: 'apac' },
+  BOM: { icao: 'VABB', name: 'Chhatrapati Shivaji Maharaj', city: 'Mumbai', country: 'India', lat: 19.0896, lon: 72.8656, region: 'apac' },
+  KUL: { icao: 'WMKK', name: 'Kuala Lumpur International', city: 'Kuala Lumpur', country: 'Malaysia', lat: 2.7456, lon: 101.7099, region: 'apac' },
+  DXB: { icao: 'OMDB', name: 'Dubai International', city: 'Dubai', country: 'UAE', lat: 25.2532, lon: 55.3657, region: 'mena' },
+  DOH: { icao: 'OTHH', name: 'Hamad International', city: 'Doha', country: 'Qatar', lat: 25.2731, lon: 51.6081, region: 'mena' },
+  AUH: { icao: 'OMAA', name: 'Abu Dhabi International', city: 'Abu Dhabi', country: 'UAE', lat: 24.4330, lon: 54.6511, region: 'mena' },
+  RUH: { icao: 'OERK', name: 'King Khalid International', city: 'Riyadh', country: 'Saudi Arabia', lat: 24.9576, lon: 46.6988, region: 'mena' },
+  CAI: { icao: 'HECA', name: 'Cairo International', city: 'Cairo', country: 'Egypt', lat: 30.1219, lon: 31.4056, region: 'mena' },
+  TLV: { icao: 'LLBG', name: 'Ben Gurion Airport', city: 'Tel Aviv', country: 'Israel', lat: 32.0055, lon: 34.8854, region: 'mena' },
+  JNB: { icao: 'FAOR', name: 'O.R. Tambo International', city: 'Johannesburg', country: 'South Africa', lat: -26.1392, lon: 28.2460, region: 'africa' },
+  NBO: { icao: 'HKJK', name: 'Jomo Kenyatta International', city: 'Nairobi', country: 'Kenya', lat: -1.3192, lon: 36.9278, region: 'africa' },
+  LOS: { icao: 'DNMM', name: 'Murtala Muhammed International', city: 'Lagos', country: 'Nigeria', lat: 6.5774, lon: 3.3212, region: 'africa' },
+  ADD: { icao: 'HAAB', name: 'Bole International', city: 'Addis Ababa', country: 'Ethiopia', lat: 8.9779, lon: 38.7993, region: 'africa' },
+  CPT: { icao: 'FACT', name: 'Cape Town International', city: 'Cape Town', country: 'South Africa', lat: -33.9715, lon: 18.6021, region: 'africa' },
+  // Added airports
+  YVR: { icao: 'CYVR', name: 'Vancouver International', city: 'Vancouver', country: 'Canada', lat: 49.1947, lon: -123.1792, region: 'americas' },
+  SCL: { icao: 'SCEL', name: 'Arturo Merino Benítez', city: 'Santiago', country: 'Chile', lat: -33.3930, lon: -70.7858, region: 'americas' },
+  DUB: { icao: 'EIDW', name: 'Dublin Airport', city: 'Dublin', country: 'Ireland', lat: 53.4264, lon: -6.2499, region: 'europe' },
+  LIS: { icao: 'LPPT', name: 'Humberto Delgado Airport', city: 'Lisbon', country: 'Portugal', lat: 38.7756, lon: -9.1354, region: 'europe' },
+  ATH: { icao: 'LGAV', name: 'Athens International', city: 'Athens', country: 'Greece', lat: 37.9364, lon: 23.9445, region: 'europe' },
+  WAW: { icao: 'EPWA', name: 'Warsaw Chopin Airport', city: 'Warsaw', country: 'Poland', lat: 52.1657, lon: 20.9671, region: 'europe' },
+  CAN: { icao: 'ZGGG', name: 'Guangzhou Baiyun International', city: 'Guangzhou', country: 'China', lat: 23.3924, lon: 113.2988, region: 'apac' },
+  TPE: { icao: 'RCTP', name: 'Taiwan Taoyuan International', city: 'Taipei', country: 'Taiwan', lat: 25.0797, lon: 121.2342, region: 'apac' },
+  MNL: { icao: 'RPLL', name: 'Ninoy Aquino International', city: 'Manila', country: 'Philippines', lat: 14.5086, lon: 121.0197, region: 'apac' },
+  AMM: { icao: 'OJAI', name: 'Queen Alia International', city: 'Amman', country: 'Jordan', lat: 31.7226, lon: 35.9932, region: 'mena' },
+  KWI: { icao: 'OKBK', name: 'Kuwait International', city: 'Kuwait City', country: 'Kuwait', lat: 29.2266, lon: 47.9689, region: 'mena' },
+  CMN: { icao: 'GMMN', name: 'Mohammed V International', city: 'Casablanca', country: 'Morocco', lat: 33.3675, lon: -7.5898, region: 'mena' },
+};
+
+const REGION_MAP = {
+  americas: 'AIRPORT_REGION_AMERICAS',
+  europe: 'AIRPORT_REGION_EUROPE',
+  apac: 'AIRPORT_REGION_APAC',
+  mena: 'AIRPORT_REGION_MENA',
+  africa: 'AIRPORT_REGION_AFRICA',
+};
+
+const DELAY_TYPE_MAP = {
+  ground_stop: 'FLIGHT_DELAY_TYPE_GROUND_STOP',
+  ground_delay: 'FLIGHT_DELAY_TYPE_GROUND_DELAY',
+  departure_delay: 'FLIGHT_DELAY_TYPE_DEPARTURE_DELAY',
+  arrival_delay: 'FLIGHT_DELAY_TYPE_ARRIVAL_DELAY',
+  general: 'FLIGHT_DELAY_TYPE_GENERAL',
+  closure: 'FLIGHT_DELAY_TYPE_CLOSURE',
+};
+
+const SEVERITY_MAP = {
+  normal: 'FLIGHT_DELAY_SEVERITY_NORMAL',
+  minor: 'FLIGHT_DELAY_SEVERITY_MINOR',
+  moderate: 'FLIGHT_DELAY_SEVERITY_MODERATE',
+  major: 'FLIGHT_DELAY_SEVERITY_MAJOR',
+  severe: 'FLIGHT_DELAY_SEVERITY_SEVERE',
+};
+
+function aviationDetermineSeverity(avgDelay, delayedPct) {
+  if (avgDelay >= 60 || (delayedPct && delayedPct >= 60)) return 'severe';
+  if (avgDelay >= 45 || (delayedPct && delayedPct >= 45)) return 'major';
+  if (avgDelay >= 30 || (delayedPct && delayedPct >= 30)) return 'moderate';
+  if (avgDelay >= 15 || (delayedPct && delayedPct >= 15)) return 'minor';
+  return 'normal';
+}
+
+function fetchAviationStackSingle(apiKey, iata) {
+  return new Promise((resolve) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const url = `https://api.aviationstack.com/v1/flights?access_key=${apiKey}&dep_iata=${iata}&flight_date=${today}&limit=100`;
+    const req = https.get(url, {
+      headers: { 'User-Agent': CHROME_UA },
+      timeout: 5000,
+      family: 4,
+    }, (resp) => {
+      if (resp.statusCode !== 200) {
+        resp.resume();
+        logThrottled('warn', `aviation-http-${resp.statusCode}:${iata}`, `[Aviation] ${iata}: HTTP ${resp.statusCode}`);
+        return resolve({ ok: false, alert: null });
+      }
+      let body = '';
+      resp.on('data', (chunk) => { body += chunk; });
+      resp.on('end', () => {
+        try {
+          const json = JSON.parse(body);
+          if (json.error) {
+            logThrottled('warn', `aviation-api-err:${iata}`, `[Aviation] ${iata}: API error: ${json.error.message}`);
+            return resolve({ ok: false, alert: null });
+          }
+          const flights = json?.data ?? [];
+          const alert = aviationAggregateFlights(iata, flights);
+          resolve({ ok: true, alert });
+        } catch { resolve({ ok: false, alert: null }); }
+      });
+    });
+    req.on('error', (err) => {
+      logThrottled('warn', `aviation-err:${iata}`, `[Aviation] ${iata}: fetch error: ${err.message}`);
+      resolve({ ok: false, alert: null });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, alert: null }); });
+  });
+}
+
+function aviationAggregateFlights(iata, flights) {
+  if (flights.length === 0) return null;
+  const meta = AIRPORT_META[iata];
+  if (!meta) return null;
+
+  let delayed = 0, cancelled = 0, totalDelay = 0, resolved = 0;
+  for (const f of flights) {
+    if (RESOLVED_STATUSES.has(f.flight_status || '')) resolved++;
+    if (f.flight_status === 'cancelled') cancelled++;
+    if (f.departure?.delay && f.departure.delay > 0) {
+      delayed++;
+      totalDelay += f.departure.delay;
+    }
+  }
+
+  const total = resolved >= AVIATION_MIN_FLIGHTS_FOR_CLOSURE ? resolved : flights.length;
+  const cancelledPct = (cancelled / total) * 100;
+  const delayedPct = (delayed / total) * 100;
+  const avgDelay = delayed > 0 ? Math.round(totalDelay / delayed) : 0;
+
+  let severity, delayType, reason;
+  if (cancelledPct >= 80 && total >= AVIATION_MIN_FLIGHTS_FOR_CLOSURE) {
+    severity = 'severe'; delayType = 'closure';
+    reason = 'Airport closure / airspace restrictions';
+  } else if (cancelledPct >= 50 && total >= AVIATION_MIN_FLIGHTS_FOR_CLOSURE) {
+    severity = 'major'; delayType = 'ground_stop';
+    reason = `${Math.round(cancelledPct)}% flights cancelled`;
+  } else if (cancelledPct >= 20 && total >= AVIATION_MIN_FLIGHTS_FOR_CLOSURE) {
+    severity = 'moderate'; delayType = 'ground_delay';
+    reason = `${Math.round(cancelledPct)}% flights cancelled`;
+  } else if (cancelledPct >= 10 && total >= AVIATION_MIN_FLIGHTS_FOR_CLOSURE) {
+    severity = 'minor'; delayType = 'general';
+    reason = `${Math.round(cancelledPct)}% flights cancelled`;
+  } else if (avgDelay > 0) {
+    severity = aviationDetermineSeverity(avgDelay, delayedPct);
+    delayType = avgDelay >= 60 ? 'ground_delay' : 'general';
+    reason = `Avg ${avgDelay}min delay, ${Math.round(delayedPct)}% delayed`;
+  } else {
+    return null;
+  }
+  if (severity === 'normal') return null;
+
+  return {
+    id: `avstack-${iata}`,
+    iata,
+    icao: meta.icao,
+    name: meta.name,
+    city: meta.city,
+    country: meta.country,
+    location: { latitude: meta.lat, longitude: meta.lon },
+    region: REGION_MAP[meta.region] || 'AIRPORT_REGION_UNSPECIFIED',
+    delayType: DELAY_TYPE_MAP[delayType] || 'FLIGHT_DELAY_TYPE_GENERAL',
+    severity: SEVERITY_MAP[severity] || 'FLIGHT_DELAY_SEVERITY_NORMAL',
+    avgDelayMinutes: avgDelay,
+    delayedFlightsPct: Math.round(delayedPct),
+    cancelledFlights: cancelled,
+    totalFlights: total,
+    reason,
+    source: 'FLIGHT_DELAY_SOURCE_AVIATIONSTACK',
+    updatedAt: Date.now(),
+  };
+}
+
+async function seedAviationDelays() {
+  if (!AVIATIONSTACK_API_KEY) {
+    console.log('[Aviation] No AVIATIONSTACK_API key — skipping seed');
+    return;
+  }
+
+  const t0 = Date.now();
+  const alerts = [];
+  let succeeded = 0, failed = 0;
+  const deadline = Date.now() + 50_000;
+
+  for (let i = 0; i < AVIATIONSTACK_AIRPORTS.length; i += AVIATION_BATCH_CONCURRENCY) {
+    if (Date.now() >= deadline) {
+      console.warn(`[Aviation] Deadline hit after ${succeeded + failed}/${AVIATIONSTACK_AIRPORTS.length} airports`);
+      break;
+    }
+    const chunk = AVIATIONSTACK_AIRPORTS.slice(i, i + AVIATION_BATCH_CONCURRENCY);
+    const results = await Promise.allSettled(
+      chunk.map((iata) => fetchAviationStackSingle(AVIATIONSTACK_API_KEY, iata))
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled') {
+        if (r.value.ok) { succeeded++; if (r.value.alert) alerts.push(r.value.alert); }
+        else failed++;
+      } else {
+        failed++;
+      }
+    }
+  }
+
+  const healthy = AVIATIONSTACK_AIRPORTS.length < 5 || failed <= succeeded;
+  if (!healthy) {
+    console.warn(`[Aviation] Systemic failure: ${failed}/${failed + succeeded} airports failed — preserving existing cache`);
+    return;
+  }
+
+  const ok = await upstashSet(AVIATION_REDIS_KEY, { alerts }, AVIATION_SEED_TTL);
+  console.log(`[Aviation] Seeded ${alerts.length} alerts (${succeeded} ok, ${failed} failed, redis: ${ok ? 'OK' : 'FAIL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+}
+
+async function startAviationSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[Aviation] Disabled (no Upstash Redis)');
+    return;
+  }
+  if (!AVIATIONSTACK_API_KEY) {
+    console.log('[Aviation] Disabled (no AVIATIONSTACK_API key)');
+    return;
+  }
+  console.log(`[Aviation] Seed loop starting (interval ${AVIATION_SEED_INTERVAL_MS / 1000 / 60 / 60}h, airports: ${AVIATIONSTACK_AIRPORTS.length})`);
+  seedAviationDelays().catch((e) => console.warn('[Aviation] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedAviationDelays().catch((e) => console.warn('[Aviation] Seed error:', e?.message || e));
+  }, AVIATION_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Cyber Threat Intelligence Seed — Railway fetches IOC feeds → writes to Redis
+// so Vercel handler (list-cyber-threats) serves from cache instead of live fetches
+// ─────────────────────────────────────────────────────────────
+const URLHAUS_AUTH_KEY = process.env.URLHAUS_AUTH_KEY || '';
+const OTX_API_KEY = process.env.OTX_API_KEY || '';
+const ABUSEIPDB_API_KEY = process.env.ABUSEIPDB_API_KEY || '';
+const CYBER_SEED_INTERVAL_MS = 2 * 60 * 60 * 1000; // 2h — matches IOC feed update cadence
+const CYBER_SEED_TTL = 10800; // 3h — survives 1 missed cycle
+const CYBER_RPC_KEY = 'cyber:threats:v2'; // must match handler REDIS_CACHE_KEY in list-cyber-threats.ts
+const CYBER_BOOTSTRAP_KEY = 'cyber:threats-bootstrap:v2';
+const CYBER_MAX_CACHED = 2000;
+const CYBER_GEO_MAX = 200;
+const CYBER_GEO_CONCURRENCY = 12;
+const CYBER_GEO_TIMEOUT_MS = 20_000;
+const CYBER_SOURCE_TIMEOUT_MS = 15_000; // longer than Vercel edge budget — OK on Railway
+
+const CYBER_COUNTRY_CENTROIDS = {
+  US:[39.8,-98.6],CA:[56.1,-106.3],MX:[23.6,-102.6],BR:[-14.2,-51.9],AR:[-38.4,-63.6],
+  GB:[55.4,-3.4],DE:[51.2,10.5],FR:[46.2,2.2],IT:[41.9,12.6],ES:[40.5,-3.7],
+  NL:[52.1,5.3],BE:[50.5,4.5],SE:[60.1,18.6],NO:[60.5,8.5],FI:[61.9,25.7],
+  DK:[56.3,9.5],PL:[51.9,19.1],CZ:[49.8,15.5],AT:[47.5,14.6],CH:[46.8,8.2],
+  PT:[39.4,-8.2],IE:[53.1,-8.2],RO:[45.9,25.0],HU:[47.2,19.5],BG:[42.7,25.5],
+  HR:[45.1,15.2],SK:[48.7,19.7],UA:[48.4,31.2],RU:[61.5,105.3],BY:[53.7,28.0],
+  TR:[39.0,35.2],GR:[39.1,21.8],RS:[44.0,21.0],CN:[35.9,104.2],JP:[36.2,138.3],
+  KR:[35.9,127.8],IN:[20.6,79.0],PK:[30.4,69.3],BD:[23.7,90.4],ID:[-0.8,113.9],
+  TH:[15.9,101.0],VN:[14.1,108.3],PH:[12.9,121.8],MY:[4.2,101.9],SG:[1.4,103.8],
+  TW:[23.7,121.0],HK:[22.4,114.1],AU:[-25.3,133.8],NZ:[-40.9,174.9],
+  ZA:[-30.6,22.9],NG:[9.1,8.7],EG:[26.8,30.8],KE:[-0.02,37.9],ET:[9.1,40.5],
+  MA:[31.8,-7.1],DZ:[28.0,1.7],TN:[33.9,9.5],GH:[7.9,-1.0],
+  SA:[23.9,45.1],AE:[23.4,53.8],IL:[31.0,34.9],IR:[32.4,53.7],IQ:[33.2,43.7],
+  KW:[29.3,47.5],QA:[25.4,51.2],BH:[26.0,50.6],JO:[30.6,36.2],LB:[33.9,35.9],
+  CL:[-35.7,-71.5],CO:[4.6,-74.3],PE:[-9.2,-75.0],VE:[6.4,-66.6],
+  KZ:[48.0,68.0],UZ:[41.4,64.6],GE:[42.3,43.4],AZ:[40.1,47.6],AM:[40.1,45.0],
+  LT:[55.2,23.9],LV:[56.9,24.1],EE:[58.6,25.0],
+  HN:[15.2,-86.2],GT:[15.8,-90.2],PA:[8.5,-80.8],CR:[9.7,-84.0],
+  SN:[14.5,-14.5],CM:[7.4,12.4],CI:[7.5,-5.5],TZ:[-6.4,34.9],UG:[1.4,32.3],
+};
+
+const CYBER_THREAT_TYPE_MAP = { c2_server:'CYBER_THREAT_TYPE_C2_SERVER', malware_host:'CYBER_THREAT_TYPE_MALWARE_HOST', phishing:'CYBER_THREAT_TYPE_PHISHING', malicious_url:'CYBER_THREAT_TYPE_MALICIOUS_URL' };
+const CYBER_SOURCE_MAP = { feodo:'CYBER_THREAT_SOURCE_FEODO', urlhaus:'CYBER_THREAT_SOURCE_URLHAUS', c2intel:'CYBER_THREAT_SOURCE_C2INTEL', otx:'CYBER_THREAT_SOURCE_OTX', abuseipdb:'CYBER_THREAT_SOURCE_ABUSEIPDB' };
+const CYBER_INDICATOR_MAP = { ip:'CYBER_THREAT_INDICATOR_TYPE_IP', domain:'CYBER_THREAT_INDICATOR_TYPE_DOMAIN', url:'CYBER_THREAT_INDICATOR_TYPE_URL' };
+const CYBER_SEVERITY_MAP = { low:'CRITICALITY_LEVEL_LOW', medium:'CRITICALITY_LEVEL_MEDIUM', high:'CRITICALITY_LEVEL_HIGH', critical:'CRITICALITY_LEVEL_CRITICAL' };
+const CYBER_SEVERITY_RANK = { CRITICALITY_LEVEL_CRITICAL:4, CRITICALITY_LEVEL_HIGH:3, CRITICALITY_LEVEL_MEDIUM:2, CRITICALITY_LEVEL_LOW:1, CRITICALITY_LEVEL_UNSPECIFIED:0 };
+
+function cyberClean(v, max) { if (typeof v !== 'string') return ''; return v.trim().replace(/\s+/g, ' ').slice(0, max || 120); }
+function cyberToNum(v) { const n = typeof v === 'number' ? v : parseFloat(String(v ?? '')); return Number.isFinite(n) ? n : null; }
+function cyberValidCoords(lat, lon) { return lat !== null && lon !== null && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180; }
+function cyberIsIPv4(v) { if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(v)) return false; return v.split('.').map(Number).every((n) => Number.isInteger(n) && n >= 0 && n <= 255); }
+function cyberIsIPv6(v) { return /^[0-9a-f:]+$/i.test(v) && v.includes(':'); }
+function cyberIsIp(v) { return cyberIsIPv4(v) || cyberIsIPv6(v); }
+function cyberNormCountry(v) { const r = cyberClean(String(v ?? ''), 64); if (!r) return ''; if (/^[a-z]{2}$/i.test(r)) return r.toUpperCase(); return r; }
+function cyberToMs(v) {
+  if (!v) return 0;
+  const raw = cyberClean(String(v), 80); if (!raw) return 0;
+  const d1 = new Date(raw); if (!isNaN(d1.getTime())) return d1.getTime();
+  const d2 = new Date(raw.replace(' UTC', 'Z').replace(' GMT', 'Z').replace(' ', 'T'));
+  return isNaN(d2.getTime()) ? 0 : d2.getTime();
+}
+function cyberNormTags(input, max) {
+  const tags = Array.isArray(input) ? input : typeof input === 'string' ? input.split(/[;,|]/g) : [];
+  const out = []; const seen = new Set();
+  for (const t of tags) { const c = cyberClean(String(t ?? ''), 40).toLowerCase(); if (!c || seen.has(c)) continue; seen.add(c); out.push(c); if (out.length >= (max || 8)) break; }
+  return out;
+}
+function cyberDjb2(s) { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) & 0xffffffff; return h; }
+function cyberCentroid(cc, seed) {
+  const c = CYBER_COUNTRY_CENTROIDS[cc ? cc.toUpperCase() : '']; if (!c) return null;
+  const k = seed || cc;
+  return { lat: c[0] + (((cyberDjb2(k) & 0xffff) / 0xffff) - 0.5) * 2, lon: c[1] + (((cyberDjb2(k + ':lon') & 0xffff) / 0xffff) - 0.5) * 2 };
+}
+function cyberSanitize(t) {
+  const ind = cyberClean(t.indicator, 255); if (!ind) return null;
+  if ((t.indicatorType || 'ip') === 'ip' && !cyberIsIp(ind)) return null;
+  return { id: cyberClean(t.id, 255) || `${t.source||'feodo'}:${t.indicatorType||'ip'}:${ind}`, type: t.type||'malicious_url', source: t.source||'feodo', indicator: ind, indicatorType: t.indicatorType||'ip', lat: t.lat??null, lon: t.lon??null, country: t.country||'', severity: t.severity||'medium', malwareFamily: cyberClean(t.malwareFamily, 80), tags: t.tags||[], firstSeen: t.firstSeen||0, lastSeen: t.lastSeen||0 };
+}
+function cyberDedupe(threats) {
+  const map = new Map();
+  for (const t of threats) {
+    const key = `${t.source}:${t.indicatorType}:${t.indicator}`;
+    const ex = map.get(key);
+    if (!ex) { map.set(key, t); continue; }
+    if ((t.lastSeen || t.firstSeen) >= (ex.lastSeen || ex.firstSeen)) map.set(key, { ...ex, ...t, tags: cyberNormTags([...ex.tags, ...t.tags]) });
+  }
+  return Array.from(map.values());
+}
+function cyberToProto(t) {
+  return { id: t.id, type: CYBER_THREAT_TYPE_MAP[t.type]||'CYBER_THREAT_TYPE_UNSPECIFIED', source: CYBER_SOURCE_MAP[t.source]||'CYBER_THREAT_SOURCE_UNSPECIFIED', indicator: t.indicator, indicatorType: CYBER_INDICATOR_MAP[t.indicatorType]||'CYBER_THREAT_INDICATOR_TYPE_UNSPECIFIED', location: cyberValidCoords(t.lat, t.lon) ? { latitude: t.lat, longitude: t.lon } : undefined, country: t.country, severity: CYBER_SEVERITY_MAP[t.severity]||'CRITICALITY_LEVEL_UNSPECIFIED', malwareFamily: t.malwareFamily, tags: t.tags, firstSeenAt: t.firstSeen, lastSeenAt: t.lastSeen };
+}
+
+function cyberHttpGetJson(url, reqHeaders, timeoutMs) {
+  return new Promise((resolve) => {
+    const req = https.get(url, { headers: { 'User-Agent': CHROME_UA, ...reqHeaders }, timeout: timeoutMs || 10000 }, (resp) => {
+      if (resp.statusCode < 200 || resp.statusCode >= 300) { resp.resume(); return resolve(null); }
+      const chunks = [];
+      resp.on('data', (c) => chunks.push(c));
+      resp.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString())); } catch { resolve(null); } });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+function cyberHttpGetText(url, reqHeaders, timeoutMs) {
+  return new Promise((resolve) => {
+    const req = https.get(url, { headers: { 'User-Agent': CHROME_UA, ...reqHeaders }, timeout: timeoutMs || 10000 }, (resp) => {
+      if (resp.statusCode < 200 || resp.statusCode >= 300) { resp.resume(); return resolve(null); }
+      const chunks = [];
+      resp.on('data', (c) => chunks.push(c));
+      resp.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+const CYBER_GEO_CACHE_MAX = 2048;
+const cyberGeoCache = new Map();
+function cyberGeoCacheSet(ip, geo) {
+  if (cyberGeoCache.size >= CYBER_GEO_CACHE_MAX) {
+    cyberGeoCache.delete(cyberGeoCache.keys().next().value);
+  }
+  cyberGeoCache.set(ip, geo);
+}
+async function cyberGeoLookup(ip) {
+  if (cyberGeoCache.has(ip)) return cyberGeoCache.get(ip);
+  const d1 = await cyberHttpGetJson(`https://ipinfo.io/${encodeURIComponent(ip)}/json`, {}, 3000);
+  if (d1?.loc) {
+    const [latS, lonS] = d1.loc.split(',');
+    const lat = parseFloat(latS), lon = parseFloat(lonS);
+    if (cyberValidCoords(lat, lon)) { const r = { lat, lon, country: String(d1.country||'').slice(0,2).toUpperCase() }; cyberGeoCacheSet(ip, r); return r; }
+  }
+  const d2 = await cyberHttpGetJson(`https://freeipapi.com/api/json/${encodeURIComponent(ip)}`, {}, 3000);
+  if (d2) {
+    const lat = parseFloat(d2.latitude), lon = parseFloat(d2.longitude);
+    if (cyberValidCoords(lat, lon)) { const r = { lat, lon, country: String(d2.countryCode||d2.countryName||'').slice(0,2).toUpperCase() }; cyberGeoCacheSet(ip, r); return r; }
+  }
+  return null;
+}
+async function cyberHydrateGeo(threats) {
+  const needsGeo = []; const seen = new Set();
+  for (const t of threats) {
+    if (cyberValidCoords(t.lat, t.lon) || t.indicatorType !== 'ip') continue;
+    const ip = t.indicator.toLowerCase();
+    if (!cyberIsIp(ip) || seen.has(ip)) continue;
+    seen.add(ip); needsGeo.push(ip);
+  }
+  if (needsGeo.length === 0) return threats;
+  const queue = [...needsGeo.slice(0, CYBER_GEO_MAX)];
+  const resolved = new Map();
+  let timedOut = false;
+  // timedOut flag stops workers from dequeuing new IPs; in-flight requests may still
+  // complete up to ~3s after the flag fires (per-request timeout). Acceptable overshoot.
+  const timeoutId = setTimeout(() => { timedOut = true; }, CYBER_GEO_TIMEOUT_MS);
+  const workers = Array.from({ length: Math.min(CYBER_GEO_CONCURRENCY, queue.length) }, async () => {
+    while (queue.length > 0 && !timedOut) {
+      const ip = queue.shift(); if (!ip) break;
+      const geo = await cyberGeoLookup(ip);
+      if (geo) resolved.set(ip, geo);
+    }
+  });
+  try { await Promise.all(workers); } catch { /* ignore */ }
+  clearTimeout(timeoutId);
+  return threats.map((t) => {
+    if (cyberValidCoords(t.lat, t.lon)) return t;
+    if (t.indicatorType !== 'ip') return t;
+    const geo = resolved.get(t.indicator.toLowerCase());
+    if (geo) return { ...t, lat: geo.lat, lon: geo.lon, country: t.country || geo.country };
+    const cen = cyberCentroid(t.country, t.indicator);
+    return cen ? { ...t, lat: cen.lat, lon: cen.lon } : t;
+  });
+}
+
+async function cyberFetchFeodo(limit, cutoffMs) {
+  try {
+    const payload = await cyberHttpGetJson('https://feodotracker.abuse.ch/downloads/ipblocklist.json', { Accept: 'application/json' }, CYBER_SOURCE_TIMEOUT_MS);
+    if (!payload) return [];
+    const records = Array.isArray(payload) ? payload : (Array.isArray(payload?.data) ? payload.data : []);
+    const out = [];
+    for (const r of records) {
+      const ip = cyberClean(r?.ip_address || r?.dst_ip || r?.ip || r?.ioc || r?.host, 80).toLowerCase();
+      if (!cyberIsIp(ip)) continue;
+      const status = cyberClean(r?.status || r?.c2_status || '', 30).toLowerCase();
+      if (status && status !== 'online' && status !== 'offline') continue;
+      const firstSeen = cyberToMs(r?.first_seen || r?.first_seen_utc || r?.dateadded);
+      const lastSeen = cyberToMs(r?.last_online || r?.last_seen || r?.last_seen_utc || r?.first_seen || r?.first_seen_utc);
+      if ((lastSeen || firstSeen) && (lastSeen || firstSeen) < cutoffMs) continue;
+      const malwareFamily = cyberClean(r?.malware || r?.malware_family || r?.family, 80);
+      const sev = status === 'online' ? (/emotet|qakbot|trickbot|dridex|ransom/i.test(malwareFamily) ? 'critical' : 'high') : 'medium';
+      const t = cyberSanitize({ id: `feodo:${ip}`, type: 'c2_server', source: 'feodo', indicator: ip, indicatorType: 'ip', lat: cyberToNum(r?.latitude ?? r?.lat), lon: cyberToNum(r?.longitude ?? r?.lon), country: cyberNormCountry(r?.country || r?.country_code), severity: sev, malwareFamily, tags: cyberNormTags(['botnet', 'c2', ...(r?.tags||[])]), firstSeen, lastSeen });
+      if (t) { out.push(t); if (out.length >= limit) break; }
+    }
+    return out;
+  } catch (e) { console.warn('[Cyber] Feodo fetch failed:', e?.message || e); return []; }
+}
+async function cyberFetchUrlhaus(limit, cutoffMs) {
+  if (!URLHAUS_AUTH_KEY) return [];
+  try {
+    const payload = await cyberHttpGetJson(`https://urlhaus-api.abuse.ch/v1/urls/recent/limit/${limit}/`, { Accept: 'application/json', 'Auth-Key': URLHAUS_AUTH_KEY }, CYBER_SOURCE_TIMEOUT_MS);
+    if (!payload) return [];
+    const rows = Array.isArray(payload?.urls) ? payload.urls : (Array.isArray(payload?.data) ? payload.data : []);
+    const out = [];
+    for (const r of rows) {
+      const rawUrl = cyberClean(r?.url || r?.ioc || '', 1024);
+      const status = cyberClean(r?.url_status || r?.status || '', 30).toLowerCase();
+      if (status && status !== 'online') continue;
+      const tags = cyberNormTags(r?.tags);
+      let hostname = ''; try { hostname = new URL(rawUrl).hostname.toLowerCase(); } catch {}
+      const recordIp = cyberClean(r?.host || r?.ip_address || r?.ip, 80).toLowerCase();
+      const ipCandidate = cyberIsIp(recordIp) ? recordIp : (cyberIsIp(hostname) ? hostname : '');
+      const indType = ipCandidate ? 'ip' : (hostname ? 'domain' : 'url');
+      const indicator = ipCandidate || hostname || rawUrl; if (!indicator) continue;
+      const firstSeen = cyberToMs(r?.dateadded || r?.firstseen || r?.first_seen);
+      const lastSeen = cyberToMs(r?.last_online || r?.last_seen || r?.dateadded);
+      if ((lastSeen || firstSeen) && (lastSeen || firstSeen) < cutoffMs) continue;
+      const threat = cyberClean(r?.threat || r?.threat_type || '', 40).toLowerCase();
+      const allTags = tags.join(' ');
+      const type = (threat.includes('phish') || allTags.includes('phish')) ? 'phishing' : (threat.includes('malware') || threat.includes('payload') || allTags.includes('malware')) ? 'malware_host' : 'malicious_url';
+      const sev = type === 'phishing' ? 'medium' : (tags.includes('ransomware') || tags.includes('botnet')) ? 'critical' : 'high';
+      const t = cyberSanitize({ id: `urlhaus:${indType}:${indicator}`, type, source: 'urlhaus', indicator, indicatorType: indType, lat: cyberToNum(r?.latitude ?? r?.lat), lon: cyberToNum(r?.longitude ?? r?.lon), country: cyberNormCountry(r?.country || r?.country_code), severity: sev, malwareFamily: cyberClean(r?.threat, 80), tags, firstSeen, lastSeen });
+      if (t) { out.push(t); if (out.length >= limit) break; }
+    }
+    return out;
+  } catch (e) { console.warn('[Cyber] URLhaus fetch failed:', e?.message || e); return []; }
+}
+async function cyberFetchC2Intel(limit) {
+  try {
+    const text = await cyberHttpGetText('https://raw.githubusercontent.com/drb-ra/C2IntelFeeds/master/feeds/IPC2s-30day.csv', { Accept: 'text/plain' }, CYBER_SOURCE_TIMEOUT_MS);
+    if (!text) return [];
+    const out = [];
+    for (const line of text.split('\n')) {
+      if (!line || line.startsWith('#')) continue;
+      const ci = line.indexOf(','); if (ci < 0) continue;
+      const ip = cyberClean(line.slice(0, ci), 80).toLowerCase(); if (!cyberIsIp(ip)) continue;
+      const desc = cyberClean(line.slice(ci + 1), 200);
+      const malwareFamily = desc.replace(/^Possible\s+/i, '').replace(/\s+C2\s+IP$/i, '').trim() || 'Unknown';
+      const tags = ['c2']; const descLow = desc.toLowerCase();
+      if (descLow.includes('cobaltstrike') || descLow.includes('cobalt strike')) tags.push('cobaltstrike');
+      if (descLow.includes('metasploit')) tags.push('metasploit');
+      if (descLow.includes('sliver')) tags.push('sliver');
+      if (descLow.includes('brute ratel') || descLow.includes('bruteratel')) tags.push('bruteratel');
+      const t = cyberSanitize({ id: `c2intel:${ip}`, type: 'c2_server', source: 'c2intel', indicator: ip, indicatorType: 'ip', lat: null, lon: null, country: '', severity: /cobaltstrike|cobalt.strike|brute.?ratel/i.test(desc) ? 'high' : 'medium', malwareFamily, tags: cyberNormTags(tags), firstSeen: 0, lastSeen: 0 });
+      if (t) { out.push(t); if (out.length >= limit) break; }
+    }
+    return out;
+  } catch (e) { console.warn('[Cyber] C2Intel fetch failed:', e?.message || e); return []; }
+}
+async function cyberFetchOtx(limit, days) {
+  if (!OTX_API_KEY) return [];
+  try {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const payload = await cyberHttpGetJson(`https://otx.alienvault.com/api/v1/indicators/export?type=IPv4&modified_since=${encodeURIComponent(since)}`, { Accept: 'application/json', 'X-OTX-API-KEY': OTX_API_KEY }, CYBER_SOURCE_TIMEOUT_MS);
+    if (!payload) return [];
+    const results = Array.isArray(payload?.results) ? payload.results : (Array.isArray(payload) ? payload : []);
+    const out = [];
+    for (const r of results) {
+      const ip = cyberClean(r?.indicator || r?.ip || '', 80).toLowerCase(); if (!cyberIsIp(ip)) continue;
+      const tags = cyberNormTags(r?.tags || []);
+      const t = cyberSanitize({ id: `otx:${ip}`, type: tags.some((tt) => /c2|botnet/.test(tt)) ? 'c2_server' : 'malware_host', source: 'otx', indicator: ip, indicatorType: 'ip', lat: null, lon: null, country: '', severity: tags.some((tt) => /ransomware|apt|c2|botnet/.test(tt)) ? 'high' : 'medium', malwareFamily: cyberClean(r?.title || r?.description || '', 200), tags, firstSeen: cyberToMs(r?.created), lastSeen: cyberToMs(r?.modified || r?.created) });
+      if (t) { out.push(t); if (out.length >= limit) break; }
+    }
+    return out;
+  } catch (e) { console.warn('[Cyber] OTX fetch failed:', e?.message || e); return []; }
+}
+async function cyberFetchAbuseIpDb(limit) {
+  if (!ABUSEIPDB_API_KEY) return [];
+  try {
+    const payload = await cyberHttpGetJson(`https://api.abuseipdb.com/api/v2/blacklist?confidenceMinimum=90&limit=${Math.min(limit, 500)}`, { Accept: 'application/json', Key: ABUSEIPDB_API_KEY }, CYBER_SOURCE_TIMEOUT_MS);
+    if (!payload) return [];
+    const records = Array.isArray(payload?.data) ? payload.data : [];
+    const out = [];
+    for (const r of records) {
+      const ip = cyberClean(r?.ipAddress || r?.ip || '', 80).toLowerCase(); if (!cyberIsIp(ip)) continue;
+      const score = cyberToNum(r?.abuseConfidenceScore) ?? 0;
+      const t = cyberSanitize({ id: `abuseipdb:${ip}`, type: 'malware_host', source: 'abuseipdb', indicator: ip, indicatorType: 'ip', lat: cyberToNum(r?.latitude ?? r?.lat), lon: cyberToNum(r?.longitude ?? r?.lon), country: cyberNormCountry(r?.countryCode || r?.country), severity: score >= 95 ? 'critical' : (score >= 80 ? 'high' : 'medium'), malwareFamily: '', tags: cyberNormTags([`score:${score}`]), firstSeen: 0, lastSeen: cyberToMs(r?.lastReportedAt) });
+      if (t) { out.push(t); if (out.length >= limit) break; }
+    }
+    return out;
+  } catch (e) { console.warn('[Cyber] AbuseIPDB fetch failed:', e?.message || e); return []; }
+}
+
+async function seedCyberThreats() {
+  const t0 = Date.now();
+  const days = 14;
+  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  const MAX_LIMIT = 1000;
+
+  const [feodo, urlhaus, c2intel, otx, abuseipdb] = await Promise.all([
+    cyberFetchFeodo(MAX_LIMIT, cutoffMs),
+    cyberFetchUrlhaus(MAX_LIMIT, cutoffMs),
+    cyberFetchC2Intel(MAX_LIMIT),
+    cyberFetchOtx(MAX_LIMIT, days),
+    cyberFetchAbuseIpDb(MAX_LIMIT),
+  ]);
+
+  if (feodo.length + urlhaus.length + c2intel.length + otx.length + abuseipdb.length === 0) {
+    console.warn('[Cyber] All sources returned 0 threats — skipping Redis write');
+    return 0;
+  }
+
+  const combined = cyberDedupe([...feodo, ...urlhaus, ...c2intel, ...otx, ...abuseipdb]);
+  const hydrated = await cyberHydrateGeo(combined);
+  const geoCount = hydrated.filter((t) => cyberValidCoords(t.lat, t.lon)).length;
+  console.log(`[Cyber] Geo resolved: ${geoCount}/${hydrated.length}`);
+
+  // Sort geo-resolved first, then by severity/recency
+  hydrated.sort((a, b) => {
+    const aGeo = cyberValidCoords(a.lat, a.lon) ? 0 : 1;
+    const bGeo = cyberValidCoords(b.lat, b.lon) ? 0 : 1;
+    if (aGeo !== bGeo) return aGeo - bGeo;
+    const bySev = (CYBER_SEVERITY_RANK[CYBER_SEVERITY_MAP[b.severity]||'']||0) - (CYBER_SEVERITY_RANK[CYBER_SEVERITY_MAP[a.severity]||'']||0);
+    return bySev !== 0 ? bySev : (b.lastSeen || b.firstSeen) - (a.lastSeen || a.firstSeen);
+  });
+
+  const threats = hydrated.slice(0, CYBER_MAX_CACHED).map(cyberToProto);
+  if (threats.length === 0) {
+    console.warn('[Cyber] No threats from any source — skipping Redis write');
+    return 0;
+  }
+
+  const payload = { threats };
+  const ok1 = await upstashSet(CYBER_RPC_KEY, payload, CYBER_SEED_TTL);
+  const ok2 = await upstashSet(CYBER_BOOTSTRAP_KEY, payload, CYBER_SEED_TTL);
+  const ok3 = await upstashSet('seed-meta:cyber:threats', { fetchedAt: Date.now(), recordCount: threats.length }, 604800);
+  console.log(`[Cyber] Seeded ${threats.length} threats (feodo:${feodo.length} urlhaus:${urlhaus.length} c2intel:${c2intel.length} otx:${otx.length} abuseipdb:${abuseipdb.length} redis:${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  return threats.length;
+}
+
+async function startCyberThreatsSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[Cyber] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[Cyber] Seed loop starting (interval ${CYBER_SEED_INTERVAL_MS / 1000 / 60 / 60}h, urlhaus:${URLHAUS_AUTH_KEY ? 'yes' : 'no'} otx:${OTX_API_KEY ? 'yes' : 'no'} abuseipdb:${ABUSEIPDB_API_KEY ? 'yes' : 'no'})`);
+  seedCyberThreats().catch((e) => console.warn('[Cyber] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedCyberThreats().catch((e) => console.warn('[Cyber] Seed error:', e?.message || e));
+  }, CYBER_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Positive Events Seed — Railway fetches GDELT GEO API → writes to Redis
+// so Vercel handler serves from cache (avoids 25s edge timeout on slow GDELT)
+// ─────────────────────────────────────────────────────────────
+const POSITIVE_EVENTS_INTERVAL_MS = 900_000; // 15 min
+const POSITIVE_EVENTS_TTL = 2700; // 3× interval
+const POSITIVE_EVENTS_RPC_KEY = 'positive-events:geo:v1';
+const POSITIVE_EVENTS_BOOTSTRAP_KEY = 'positive-events:geo-bootstrap:v1';
+const POSITIVE_EVENTS_MAX = 500;
+
+const POSITIVE_QUERIES = [
+  '(breakthrough OR discovery OR "renewable energy")',
+  '(conservation OR "poverty decline" OR "humanitarian aid")',
+  '("good news" OR volunteer OR donation OR charity)',
+];
+
+// Mirrors CATEGORY_KEYWORDS from src/services/positive-classifier.ts — keep in sync
+const POSITIVE_CATEGORY_KEYWORDS = [
+  ['clinical trial', 'science-health'], ['study finds', 'science-health'],
+  ['researchers', 'science-health'], ['scientists', 'science-health'],
+  ['breakthrough', 'science-health'], ['discovery', 'science-health'],
+  ['cure', 'science-health'], ['vaccine', 'science-health'],
+  ['treatment', 'science-health'], ['medical', 'science-health'],
+  ['endangered species', 'nature-wildlife'], ['conservation', 'nature-wildlife'],
+  ['wildlife', 'nature-wildlife'], ['species', 'nature-wildlife'],
+  ['marine', 'nature-wildlife'], ['forest', 'nature-wildlife'],
+  ['renewable', 'climate-wins'], ['solar', 'climate-wins'],
+  ['wind energy', 'climate-wins'], ['electric vehicle', 'climate-wins'],
+  ['emissions', 'climate-wins'], ['carbon', 'climate-wins'],
+  ['clean energy', 'climate-wins'], ['climate', 'climate-wins'],
+  ['robot', 'innovation-tech'], ['technology', 'innovation-tech'],
+  ['startup', 'innovation-tech'], ['innovation', 'innovation-tech'],
+  ['artificial intelligence', 'innovation-tech'],
+  ['volunteer', 'humanity-kindness'], ['donated', 'humanity-kindness'],
+  ['charity', 'humanity-kindness'], ['rescued', 'humanity-kindness'],
+  ['hero', 'humanity-kindness'], ['kindness', 'humanity-kindness'],
+  [' art ', 'culture-community'], ['music', 'culture-community'],
+  ['festival', 'culture-community'], ['education', 'culture-community'],
+];
+
+function classifyPositiveName(name) {
+  const lower = ` ${name.toLowerCase()} `;
+  for (const [kw, cat] of POSITIVE_CATEGORY_KEYWORDS) {
+    if (lower.includes(kw)) return cat;
+  }
+  return 'humanity-kindness';
+}
+
+function fetchGdeltGeoPositive(query) {
+  return new Promise((resolve) => {
+    const params = new URLSearchParams({ query, maxrows: '500' });
+    const req = https.get(`https://api.gdeltproject.org/api/v1/gkg_geojson?${params}`, {
+      headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+      timeout: 15000,
+    }, (resp) => {
+      if (resp.statusCode !== 200) { resp.resume(); return resolve([]); }
+      let body = '';
+      resp.on('data', (chunk) => { body += chunk; });
+      resp.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          const features = Array.isArray(data?.features) ? data.features : [];
+          const locationMap = new Map();
+          for (const f of features) {
+            const name = String(f.properties?.name || '').substring(0, 200);
+            if (!name) continue;
+            if (name.startsWith('ERROR:') || name.includes('unknown error')) continue;
+            const coords = f.geometry?.coordinates;
+            if (!Array.isArray(coords) || coords.length < 2) continue;
+            const [lon, lat] = coords;
+            if (!Number.isFinite(lat) || !Number.isFinite(lon) || lat < -90 || lat > 90 || lon < -180 || lon > 180) continue;
+            const key = `${lat.toFixed(1)}:${lon.toFixed(1)}`;
+            const existing = locationMap.get(key);
+            if (existing) { existing.count++; }
+            else { locationMap.set(key, { latitude: lat, longitude: lon, name, count: 1 }); }
+          }
+          const events = [];
+          for (const [, loc] of locationMap) {
+            if (loc.count < 3) continue;
+            events.push({ latitude: loc.latitude, longitude: loc.longitude, name: loc.name, category: classifyPositiveName(loc.name), count: loc.count, timestamp: Date.now() });
+          }
+          resolve(events);
+        } catch { resolve([]); }
+      });
+    });
+    req.on('error', () => resolve([]));
+    req.on('timeout', () => { req.destroy(); resolve([]); });
+  });
+}
+
+let positiveEventsInFlight = false;
+
+async function seedPositiveEvents() {
+  if (positiveEventsInFlight) return;
+  positiveEventsInFlight = true;
+  const t0 = Date.now();
+  try {
+    const allEvents = [];
+    const seenNames = new Set();
+    let anyQuerySucceeded = false;
+
+    for (let i = 0; i < POSITIVE_QUERIES.length; i++) {
+      if (i > 0) await new Promise((r) => setTimeout(r, 5_500)); // GDELT rate limit: 1 req per 5s
+      try {
+        const events = await fetchGdeltGeoPositive(POSITIVE_QUERIES[i]);
+        anyQuerySucceeded = true;
+        for (const e of events) {
+          if (!seenNames.has(e.name)) {
+            seenNames.add(e.name);
+            allEvents.push(e);
+          }
+        }
+      } catch { /* individual query failure is non-fatal */ }
+    }
+
+    if (!anyQuerySucceeded) {
+      console.warn('[PositiveEvents] All queries failed — preserving last good data');
+      return;
+    }
+
+    const capped = allEvents.slice(0, POSITIVE_EVENTS_MAX);
+    const payload = { events: capped, fetchedAt: Date.now() };
+    const ok1 = await upstashSet(POSITIVE_EVENTS_RPC_KEY, payload, POSITIVE_EVENTS_TTL);
+    const ok2 = await upstashSet(POSITIVE_EVENTS_BOOTSTRAP_KEY, payload, POSITIVE_EVENTS_TTL);
+    const ok3 = await upstashSet('seed-meta:positive-events:geo', { fetchedAt: Date.now(), recordCount: capped.length }, 604800);
+    console.log(`[PositiveEvents] Seeded ${capped.length} events (redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[PositiveEvents] Seed error:', e?.message || e);
+  } finally {
+    positiveEventsInFlight = false;
+  }
+}
+
+async function startPositiveEventsSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[PositiveEvents] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[PositiveEvents] Seed loop starting (interval ${POSITIVE_EVENTS_INTERVAL_MS / 1000 / 60}min)`);
+  seedPositiveEvents().catch((e) => console.warn('[PositiveEvents] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedPositiveEvents().catch((e) => console.warn('[PositiveEvents] Seed error:', e?.message || e));
+  }, POSITIVE_EVENTS_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// AI Classification Seed — batch-classify digest titles via LLM → Redis
+// Clients get pre-classified items from digest, zero classify-event RPCs
+// ─────────────────────────────────────────────────────────────
+const CLASSIFY_SEED_INTERVAL_MS = 15 * 60 * 1000;
+const CLASSIFY_CACHE_TTL = 86400;
+const CLASSIFY_SKIP_TTL = 1800;
+const CLASSIFY_BATCH_SIZE = 50;
+const CLASSIFY_VARIANTS = ['full', 'tech', 'finance', 'happy', 'commodity'];
+const CLASSIFY_VARIANT_STAGGER_MS = 3 * 60 * 1000;
+
+const CLASSIFY_VALID_LEVELS = ['critical', 'high', 'medium', 'low', 'info'];
+const CLASSIFY_VALID_CATEGORIES = [
+  'conflict', 'protest', 'disaster', 'diplomatic', 'economic',
+  'terrorism', 'cyber', 'health', 'environmental', 'military',
+  'crime', 'infrastructure', 'tech', 'general',
+];
+
+const CLASSIFY_SYSTEM_PROMPT = `You classify news headlines by threat level and category. Return ONLY a JSON array, no other text.
+
+Levels: critical, high, medium, low, info
+Categories: conflict, protest, disaster, diplomatic, economic, terrorism, cyber, health, environmental, military, crime, infrastructure, tech, general
+
+Input: numbered lines "index|Title"
+Output: [{"i":0,"l":"high","c":"conflict"}, ...]
+
+Focus: geopolitical events, conflicts, disasters, diplomacy. Classify by real-world severity and impact.`;
+
+function classifyCacheKey(title) {
+  const hash = crypto.createHash('sha256').update(title.toLowerCase()).digest('hex').slice(0, 16);
+  return `classify:sebuf:v1:${hash}`;
+}
+
+function classifyFetchLlm(titles, apiKey, apiUrl, model) {
+  return new Promise((resolve) => {
+    const sanitized = titles.map((t) => t.replace(/[\n\r]/g, ' ').replace(/\|/g, '/').slice(0, 200).trim());
+    const prompt = sanitized.map((t, i) => `${i}|${t}`).join('\n');
+    const bodyStr = JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: CLASSIFY_SYSTEM_PROMPT },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0,
+      max_tokens: titles.length * 40,
+    });
+
+    const parsed = new URL(apiUrl);
+    const transport = parsed.protocol === 'http:' ? http : https;
+    const req = transport.request(parsed, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        'User-Agent': CHROME_UA,
+        'Content-Length': Buffer.byteLength(bodyStr),
+      },
+      timeout: 30000,
+    }, (resp) => {
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        resp.resume();
+        return resolve(null);
+      }
+      let data = '';
+      resp.on('data', (chunk) => { data += chunk; });
+      resp.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const raw = json?.choices?.[0]?.message?.content?.trim();
+          if (!raw) return resolve(null);
+          const match = raw.match(/\[[\s\S]*\]/);
+          if (!match) return resolve(null);
+          resolve(JSON.parse(match[0]));
+        } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.end(bodyStr);
+  });
+}
+
+let classifyInFlight = false;
+
+async function seedClassifyForVariant(variant, apiKey, apiUrl, model) {
+  const digestUrl = `https://api.worldmonitor.app/api/news/v1/list-feed-digest?variant=${variant}&lang=en`;
+  let digest;
+  try {
+    const resp = await new Promise((resolve, reject) => {
+      const req = https.get(digestUrl, {
+        headers: { Accept: 'application/json', 'User-Agent': CHROME_UA },
+        timeout: 15000,
+      }, resolve);
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    });
+    if (resp.statusCode !== 200) { resp.resume(); return { total: 0, classified: 0, skipped: 0 }; }
+    const body = await new Promise((resolve) => {
+      let d = '';
+      resp.on('data', (c) => { d += c; });
+      resp.on('end', () => resolve(d));
+    });
+    digest = JSON.parse(body);
+  } catch {
+    return { total: 0, classified: 0, skipped: 0 };
+  }
+
+  const allTitles = new Set();
+  if (digest?.categories) {
+    for (const bucket of Object.values(digest.categories)) {
+      for (const item of bucket?.items ?? []) {
+        if (item?.title) allTitles.add(item.title);
+      }
+    }
+  }
+  if (allTitles.size === 0) return { total: 0, classified: 0, skipped: 0 };
+
+  const titleArr = [...allTitles];
+  const cacheKeys = titleArr.map((t) => classifyCacheKey(t));
+
+  const cached = await upstashMGet(cacheKeys);
+  const misses = [];
+  for (let i = 0; i < titleArr.length; i++) {
+    if (!cached[i]) misses.push(titleArr[i]);
+  }
+
+  if (misses.length === 0) return { total: titleArr.length, classified: 0, skipped: 0 };
+
+  let classified = 0;
+  let skipped = 0;
+
+  for (let b = 0; b < misses.length; b += CLASSIFY_BATCH_SIZE) {
+    const chunk = misses.slice(b, b + CLASSIFY_BATCH_SIZE);
+    const llmResult = await classifyFetchLlm(chunk, apiKey, apiUrl, model);
+
+    if (!Array.isArray(llmResult)) {
+      for (const title of chunk) {
+        await upstashSet(classifyCacheKey(title), { level: '_skip', timestamp: Date.now() }, CLASSIFY_SKIP_TTL);
+        skipped++;
+      }
+      continue;
+    }
+
+    const classifiedSet = new Set();
+    for (const entry of llmResult) {
+      const idx = entry?.i;
+      if (typeof idx !== 'number' || idx < 0 || idx >= chunk.length) continue;
+      if (classifiedSet.has(idx)) continue;
+      const level = CLASSIFY_VALID_LEVELS.includes(entry?.l) ? entry.l : null;
+      const category = CLASSIFY_VALID_CATEGORIES.includes(entry?.c) ? entry.c : null;
+      if (!level || !category) continue;
+      classifiedSet.add(idx);
+      await upstashSet(classifyCacheKey(chunk[idx]), { level, category, timestamp: Date.now() }, CLASSIFY_CACHE_TTL);
+      classified++;
+    }
+
+    for (let i = 0; i < chunk.length; i++) {
+      if (!classifiedSet.has(i)) {
+        await upstashSet(classifyCacheKey(chunk[i]), { level: '_skip', timestamp: Date.now() }, CLASSIFY_SKIP_TTL);
+        skipped++;
+      }
+    }
+  }
+
+  return { total: titleArr.length, classified, skipped };
+}
+
+async function seedClassify() {
+  if (classifyInFlight) return;
+  classifyInFlight = true;
+  const t0 = Date.now();
+  try {
+    const apiKey = process.env.LLM_API_KEY || process.env.GROQ_API_KEY;
+    const apiUrl = process.env.LLM_API_URL || 'https://api.groq.com/openai/v1/chat/completions';
+    const model = process.env.LLM_MODEL || 'llama-3.1-8b-instant';
+    if (!apiKey) {
+      console.log('[Classify] Skipped — no LLM_API_KEY or GROQ_API_KEY');
+      return;
+    }
+    const isProd = process.env.RAILWAY_ENVIRONMENT === 'production';
+    if (isProd && !apiUrl.startsWith('https://') && !apiUrl.startsWith('http://localhost')) {
+      console.warn('[Classify] LLM_API_URL must be HTTPS in production — skipping');
+      return;
+    }
+
+    let totalClassified = 0;
+    let totalSkipped = 0;
+    for (let v = 0; v < CLASSIFY_VARIANTS.length; v++) {
+      if (v > 0) await new Promise((r) => setTimeout(r, CLASSIFY_VARIANT_STAGGER_MS));
+      try {
+        const stats = await seedClassifyForVariant(CLASSIFY_VARIANTS[v], apiKey, apiUrl, model);
+        totalClassified += stats.classified;
+        totalSkipped += stats.skipped;
+        console.log(`[Classify] ${CLASSIFY_VARIANTS[v]}: ${stats.total} titles, ${stats.classified} classified, ${stats.skipped} skipped`);
+      } catch (e) {
+        console.warn(`[Classify] ${CLASSIFY_VARIANTS[v]} error:`, e?.message || e);
+      }
+    }
+
+    await upstashSet('seed-meta:classify', { fetchedAt: Date.now(), recordCount: totalClassified }, 604800);
+    console.log(`[Classify] Done in ${((Date.now() - t0) / 1000).toFixed(1)}s — ${totalClassified} classified, ${totalSkipped} skipped`);
+  } catch (e) {
+    console.warn('[Classify] Seed error:', e?.message || e);
+  } finally {
+    classifyInFlight = false;
+  }
+}
+
+async function startClassifySeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[Classify] Disabled (no Upstash Redis)');
+    return;
+  }
+  const apiKey = process.env.LLM_API_KEY || process.env.GROQ_API_KEY;
+  console.log(`[Classify] Seed loop starting (interval ${CLASSIFY_SEED_INTERVAL_MS / 1000 / 60}min, apiKey:${apiKey ? 'yes' : 'no'})`);
+  seedClassify().catch((e) => console.warn('[Classify] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedClassify().catch((e) => console.warn('[Classify] Seed error:', e?.message || e));
+  }, CLASSIFY_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Service Statuses Seed — warm-pings Vercel RPC every 15 min
+// so service statuses are always cached (TTL is 30 min).
+// ─────────────────────────────────────────────────────────────
+const SERVICE_STATUSES_SEED_INTERVAL_MS = 15 * 60 * 1000; // 15 min (TTL/2)
+const SERVICE_STATUSES_RPC_URL = 'https://api.worldmonitor.app/api/infrastructure/v1/list-service-statuses';
+
+async function seedServiceStatuses() {
+  try {
+    const resp = await fetch(SERVICE_STATUSES_RPC_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': CHROME_UA,
+        Origin: 'https://worldmonitor.app',
+      },
+      body: '{}',
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[ServiceStatuses] Seed ping failed: HTTP ${resp.status}`);
+      return;
+    }
+    const data = await resp.json();
+    const count = data?.statuses?.length || 0;
+    console.log(`[ServiceStatuses] Seed ping OK — ${count} statuses`);
+  } catch (e) {
+    console.warn('[ServiceStatuses] Seed ping error:', e?.message || e);
+  }
+}
+
+function startServiceStatusesSeedLoop() {
+  console.log(`[ServiceStatuses] Seed loop starting (interval ${SERVICE_STATUSES_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedServiceStatuses().catch((e) => console.warn('[ServiceStatuses] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedServiceStatuses().catch((e) => console.warn('[ServiceStatuses] Seed error:', e?.message || e));
+  }, SERVICE_STATUSES_SEED_INTERVAL_MS).unref?.();
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Theater Posture Seed — fetches OpenSky directly via localhost
+// proxy, computes military postures, writes to Redis.
+// Eliminates circular dependency on Vercel RPC.
+// ─────────────────────────────────────────────────────────────
+const THEATER_POSTURE_SEED_INTERVAL_MS = 600_000; // 10 min
+const THEATER_POSTURE_LIVE_KEY = 'theater-posture:sebuf:v1';
+const THEATER_POSTURE_STALE_KEY = 'theater-posture:sebuf:stale:v1';
+const THEATER_POSTURE_BACKUP_KEY = 'theater-posture:sebuf:backup:v1';
+const THEATER_POSTURE_LIVE_TTL = 900;    // 15 min
+const THEATER_POSTURE_STALE_TTL = 86400; // 24h
+const THEATER_POSTURE_BACKUP_TTL = 604800; // 7d
+
+const THEATER_MIL_PREFIXES = [
+  'RCH', 'REACH', 'MOOSE', 'EVAC', 'DUSTOFF', 'PEDRO',
+  'DUKE', 'HAVOC', 'KNIFE', 'WARHAWK', 'VIPER', 'RAGE', 'FURY',
+  'SHELL', 'TEXACO', 'ARCO', 'ESSO', 'PETRO',
+  'SENTRY', 'AWACS', 'MAGIC', 'DISCO', 'DARKSTAR',
+  'COBRA', 'PYTHON', 'RAPTOR', 'EAGLE', 'HAWK', 'TALON',
+  'BOXER', 'OMNI', 'TOPCAT', 'SKULL', 'REAPER', 'HUNTER',
+  'ARMY', 'NAVY', 'USAF', 'USMC', 'USCG',
+  'CNV', 'EXEC',
+  'NATO', 'GAF', 'RRF', 'RAF', 'FAF', 'IAF', 'RNLAF', 'BAF', 'DAF', 'HAF', 'PAF',
+  'SWORD', 'LANCE', 'ARROW', 'SPARTAN',
+  'RSAF', 'EMIRI', 'UAEAF', 'KAF', 'QAF', 'BAHAF', 'OMAAF',
+  'IRIAF', 'IRGC',
+  'TUAF',
+  'RSD', 'RFF', 'VKS',
+  'CHN', 'PLAAF', 'PLA',
+];
+const THEATER_MIL_SHORT_PREFIXES = ['AE', 'RF', 'TF', 'PAT', 'SAM', 'OPS', 'CTF', 'IRG', 'TAF'];
+const THEATER_AIRLINE_CODES = new Set([
+  'SVA', 'QTR', 'THY', 'UAE', 'ETD', 'GFA', 'MEA', 'RJA', 'KAC', 'ELY',
+  'IAW', 'IRA', 'MSR', 'SYR', 'PGT', 'AXB', 'FDB', 'KNE', 'FAD', 'ADY', 'OMA',
+  'ABQ', 'ABY', 'NIA', 'FJA', 'SWR', 'HZA', 'OMS', 'EGF', 'NOS', 'SXD',
+]);
+
+function theaterIsMilCallsign(callsign) {
+  if (!callsign) return false;
+  const cs = callsign.toUpperCase().trim();
+  for (const prefix of THEATER_MIL_PREFIXES) {
+    if (cs.startsWith(prefix)) return true;
+  }
+  for (const prefix of THEATER_MIL_SHORT_PREFIXES) {
+    if (cs.startsWith(prefix) && cs.length > prefix.length && /\d/.test(cs.charAt(prefix.length))) return true;
+  }
+  if (/^[A-Z]{3}\d{1,2}$/.test(cs)) {
+    const prefix = cs.slice(0, 3);
+    if (!THEATER_AIRLINE_CODES.has(prefix)) return true;
+  }
+  return false;
+}
+
+function theaterDetectAircraftType(callsign) {
+  if (!callsign) return 'unknown';
+  const cs = callsign.toUpperCase().trim();
+  if (/^(SHELL|TEXACO|ARCO|ESSO|PETRO|KC|STRAT)/.test(cs)) return 'tanker';
+  if (/^(SENTRY|AWACS|MAGIC|DISCO|DARKSTAR|E3|E8|E6)/.test(cs)) return 'awacs';
+  if (/^(RCH|REACH|MOOSE|EVAC|DUSTOFF|C17|C5|C130|C40)/.test(cs)) return 'transport';
+  if (/^(HOMER|OLIVE|JAKE|PSEUDO|GORDO|RC|U2|SR)/.test(cs)) return 'reconnaissance';
+  if (/^(RQ|MQ|REAPER|PREDATOR|GLOBAL)/.test(cs)) return 'drone';
+  if (/^(DEATH|BONE|DOOM|B52|B1|B2)/.test(cs)) return 'bomber';
+  if (/^(BOLT|VIPER|RAPTOR|BRONCO|EAGLE|HORNET|FALCON|STRIKE|TANGO|FURY)/.test(cs)) return 'fighter';
+  return 'unknown';
+}
+
+const POSTURE_THEATERS = [
+  { id: 'iran-theater', bounds: { north: 42, south: 20, east: 65, west: 30 }, thresholds: { elevated: 8, critical: 20 }, strikeIndicators: { minTankers: 2, minAwacs: 1, minFighters: 5 } },
+  { id: 'taiwan-theater', bounds: { north: 30, south: 18, east: 130, west: 115 }, thresholds: { elevated: 6, critical: 15 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 4 } },
+  { id: 'baltic-theater', bounds: { north: 65, south: 52, east: 32, west: 10 }, thresholds: { elevated: 5, critical: 12 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'blacksea-theater', bounds: { north: 48, south: 40, east: 42, west: 26 }, thresholds: { elevated: 4, critical: 10 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'korea-theater', bounds: { north: 43, south: 33, east: 132, west: 124 }, thresholds: { elevated: 5, critical: 12 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'south-china-sea', bounds: { north: 25, south: 5, east: 121, west: 105 }, thresholds: { elevated: 6, critical: 15 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 4 } },
+  { id: 'east-med-theater', bounds: { north: 37, south: 33, east: 37, west: 25 }, thresholds: { elevated: 4, critical: 10 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'israel-gaza-theater', bounds: { north: 33, south: 29, east: 36, west: 33 }, thresholds: { elevated: 3, critical: 8 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+  { id: 'yemen-redsea-theater', bounds: { north: 22, south: 11, east: 54, west: 32 }, thresholds: { elevated: 4, critical: 10 }, strikeIndicators: { minTankers: 1, minAwacs: 1, minFighters: 3 } },
+];
+
+const THEATER_QUERY_REGIONS = [
+  { name: 'WESTERN', lamin: 10, lamax: 66, lomin: 9, lomax: 66 },
+  { name: 'PACIFIC', lamin: 4, lamax: 44, lomin: 104, lomax: 133 },
+];
+
+async function fetchTheaterFlightsFromOpenSky() {
+  const seenIds = new Set();
+  const allFlights = [];
+  for (const region of THEATER_QUERY_REGIONS) {
+    const params = `lamin=${region.lamin}&lamax=${region.lamax}&lomin=${region.lomin}&lomax=${region.lomax}`;
+    const resp = await fetch(`http://localhost:${PORT}/opensky?${params}`, {
+      headers: { 'User-Agent': CHROME_UA, ...(RELAY_SHARED_SECRET ? { 'x-relay-key': RELAY_SHARED_SECRET } : {}) },
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!resp.ok) throw new Error(`OpenSky proxy ${resp.status} for ${region.name}`);
+    const data = await resp.json();
+    if (!data.states) continue;
+    for (const state of data.states) {
+      const [icao24, callsign, , , , lon, lat, altitude, onGround, velocity, heading] = state;
+      if (lat == null || lon == null || onGround) continue;
+      if (!theaterIsMilCallsign(callsign)) continue;
+      if (seenIds.has(icao24)) continue;
+      seenIds.add(icao24);
+      allFlights.push({
+        id: icao24,
+        callsign: (callsign || '').trim(),
+        lat, lon,
+        altitude: altitude || 0,
+        heading: heading || 0,
+        speed: velocity || 0,
+        aircraftType: theaterDetectAircraftType(callsign),
+      });
+    }
+  }
+  return allFlights;
+}
+
+async function fetchTheaterFlightsFromWingbits() {
+  const apiKey = process.env.WINGBITS_API_KEY;
+  if (!apiKey) return null;
+  const areas = POSTURE_THEATERS.map((t) => ({
+    alias: t.id,
+    by: 'box',
+    la: (t.bounds.north + t.bounds.south) / 2,
+    lo: (t.bounds.east + t.bounds.west) / 2,
+    w: Math.abs(t.bounds.east - t.bounds.west) * 60,
+    h: Math.abs(t.bounds.north - t.bounds.south) * 60,
+    unit: 'nm',
+  }));
+  try {
+    const resp = await fetch('https://customer-api.wingbits.com/v1/flights', {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, Accept: 'application/json', 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
+      body: JSON.stringify(areas),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const flights = [];
+    const seenIds = new Set();
+    for (const areaResult of data) {
+      const flightList = Array.isArray(areaResult.data) ? areaResult.data
+        : Array.isArray(areaResult.flights) ? areaResult.flights
+        : Array.isArray(areaResult) ? areaResult : [];
+      for (const f of flightList) {
+        const icao24 = f.h || f.icao24 || f.id;
+        if (!icao24 || seenIds.has(icao24)) continue;
+        seenIds.add(icao24);
+        const callsign = (f.f || f.callsign || f.flight || '').trim();
+        if (!theaterIsMilCallsign(callsign)) continue;
+        flights.push({
+          id: icao24, callsign,
+          lat: f.la || f.latitude || f.lat,
+          lon: f.lo || f.longitude || f.lon || f.lng,
+          altitude: f.ab || f.altitude || f.alt || 0,
+          heading: f.th || f.heading || f.track || 0,
+          speed: f.gs || f.groundSpeed || f.speed || f.velocity || 0,
+          aircraftType: theaterDetectAircraftType(callsign),
+        });
+      }
+    }
+    return flights;
+  } catch {
+    return null;
+  }
+}
+
+function calculateTheaterPostures(flights) {
+  return POSTURE_THEATERS.map((theater) => {
+    const tf = flights.filter(
+      (f) => f.lat >= theater.bounds.south && f.lat <= theater.bounds.north &&
+        f.lon >= theater.bounds.west && f.lon <= theater.bounds.east,
+    );
+    const total = tf.length;
+    const tankers = tf.filter((f) => f.aircraftType === 'tanker').length;
+    const awacs = tf.filter((f) => f.aircraftType === 'awacs').length;
+    const fighters = tf.filter((f) => f.aircraftType === 'fighter').length;
+    const postureLevel = total >= theater.thresholds.critical ? 'critical'
+      : total >= theater.thresholds.elevated ? 'elevated' : 'normal';
+    const strikeCapable = tankers >= theater.strikeIndicators.minTankers &&
+      awacs >= theater.strikeIndicators.minAwacs && fighters >= theater.strikeIndicators.minFighters;
+    const ops = [];
+    if (strikeCapable) ops.push('strike_capable');
+    if (tankers > 0) ops.push('aerial_refueling');
+    if (awacs > 0) ops.push('airborne_early_warning');
+    return {
+      theater: theater.id, postureLevel, activeFlights: total,
+      trackedVessels: 0, activeOperations: ops, assessedAt: Date.now(),
+    };
+  });
+}
+async function seedTheaterPosture() {
+  const t0 = Date.now();
+  let flights = [];
+  try {
+    flights = await fetchTheaterFlightsFromOpenSky();
+  } catch (e) {
+    console.warn(`[TheaterPosture] OpenSky failed: ${e?.message || e}`);
+  }
+  if (flights.length === 0) {
+    const wb = await fetchTheaterFlightsFromWingbits();
+    if (wb && wb.length > 0) flights = wb;
+  }
+  if (flights.length === 0) {
+    console.warn('[TheaterPosture] No military flights from OpenSky or Wingbits — skipping');
+    return;
+  }
+  const theaters = calculateTheaterPostures(flights);
+  const payload = { theaters };
+  const ok1 = await upstashSet(THEATER_POSTURE_LIVE_KEY, payload, THEATER_POSTURE_LIVE_TTL);
+  const ok2 = await upstashSet(THEATER_POSTURE_STALE_KEY, payload, THEATER_POSTURE_STALE_TTL);
+  const ok3 = await upstashSet(THEATER_POSTURE_BACKUP_KEY, payload, THEATER_POSTURE_BACKUP_TTL);
+  await upstashSet('seed-meta:theater-posture', { fetchedAt: Date.now(), recordCount: flights.length }, 604800);
+  const elevated = theaters.filter((t) => t.postureLevel !== 'normal').length;
+  const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+  console.log(`[TheaterPosture] Seeded ${flights.length} mil flights, ${theaters.length} theaters (${elevated} elevated), redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'} [${elapsed}s]`);
+}
+
+function startTheaterPostureSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[TheaterPosture] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[TheaterPosture] Seed loop starting (interval ${THEATER_POSTURE_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  // Delay initial seed 30s to let the relay's OpenSky proxy start up
+  setTimeout(() => {
+    seedTheaterPosture().catch((e) => console.warn('[TheaterPosture] Initial seed error:', e?.message || e));
+    setInterval(() => {
+      seedTheaterPosture().catch((e) => console.warn('[TheaterPosture] Seed error:', e?.message || e));
+    }, THEATER_POSTURE_SEED_INTERVAL_MS).unref?.();
+  }, 30_000);
+}
+
+// ─────────────────────────────────────────────────────────────
+// CII Risk Scores warm-ping — keeps RPC cache fresh so
+// bootstrap stale key never expires.
+// The RPC handler itself refreshes the stale key on every call.
+// ─────────────────────────────────────────────────────────────
+const CII_WARM_PING_INTERVAL_MS = 8 * 60 * 1000; // 8 min (live cache TTL is 10 min)
+const CII_RPC_URL = 'https://api.worldmonitor.app/api/intelligence/v1/get-risk-scores';
+
+async function seedCiiWarmPing() {
+  try {
+    const resp = await fetch(CII_RPC_URL, {
+      headers: {
+        'User-Agent': CHROME_UA,
+        Origin: 'https://worldmonitor.app',
+      },
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[CII] Warm-ping failed: HTTP ${resp.status}`);
+      return;
+    }
+    const data = await resp.json();
+    const count = data?.ciiScores?.length || 0;
+    console.log(`[CII] Warm-ping OK: ${count} scores`);
+  } catch (e) {
+    console.warn('[CII] Warm-ping error:', e?.message || e);
+  }
+}
+
+function startCiiWarmPingLoop() {
+  console.log(`[CII] Warm-ping loop starting (interval ${CII_WARM_PING_INTERVAL_MS / 1000 / 60}min)`);
+  seedCiiWarmPing().catch((e) => console.warn('[CII] Initial warm-ping error:', e?.message || e));
+  setInterval(() => {
+    seedCiiWarmPing().catch((e) => console.warn('[CII] Warm-ping error:', e?.message || e));
+  }, CII_WARM_PING_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Weather Alerts Seed — NWS API → Redis every 15 min
+// ─────────────────────────────────────────────────────────────
+const WEATHER_SEED_INTERVAL_MS = 15 * 60 * 1000; // 15 min
+const WEATHER_REDIS_KEY = 'weather:alerts:v1';
+const WEATHER_CACHE_TTL = 900;
+let weatherSeedInFlight = false;
+
+async function seedWeatherAlerts() {
+  if (weatherSeedInFlight) return;
+  weatherSeedInFlight = true;
+  const t0 = Date.now();
+  try {
+    const resp = await fetch('https://api.weather.gov/alerts/active', {
+      headers: { Accept: 'application/geo+json', 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) {
+      console.warn(`[Weather] Seed failed: HTTP ${resp.status}`);
+      return;
+    }
+    const data = await resp.json();
+    const features = data.features || [];
+    const alerts = features
+      .filter((f) => f?.properties?.severity !== 'Unknown')
+      .slice(0, 50)
+      .map((f) => {
+        const p = f.properties;
+        let coords = [];
+        try {
+          const g = f.geometry;
+          if (g?.type === 'Polygon') coords = g.coordinates[0]?.map((c) => [c[0], c[1]]) || [];
+          else if (g?.type === 'MultiPolygon') coords = g.coordinates[0]?.[0]?.map((c) => [c[0], c[1]]) || [];
+        } catch { /* ignore */ }
+        const centroid = coords.length > 0
+          ? [coords.reduce((s, c) => s + c[0], 0) / coords.length, coords.reduce((s, c) => s + c[1], 0) / coords.length]
+          : undefined;
+        return {
+          id: f.id || '', event: p.event || '', severity: p.severity || 'Unknown',
+          headline: p.headline || '', description: (p.description || '').slice(0, 500),
+          areaDesc: p.areaDesc || '', onset: p.onset || '', expires: p.expires || '',
+          coordinates: coords, centroid,
+        };
+      });
+    if (alerts.length === 0) {
+      console.warn('[Weather] No alerts returned — preserving last good data');
+      return;
+    }
+    const payload = { alerts };
+    const ok1 = await upstashSet(WEATHER_REDIS_KEY, payload, WEATHER_CACHE_TTL);
+    const ok2 = await upstashSet('seed-meta:weather:alerts', { fetchedAt: Date.now(), recordCount: alerts.length }, 604800);
+    console.log(`[Weather] Seeded ${alerts.length} alerts (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[Weather] Seed error:', e?.message || e);
+  } finally {
+    weatherSeedInFlight = false;
+  }
+}
+
+async function startWeatherSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[Weather] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[Weather] Seed loop starting (interval ${WEATHER_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedWeatherAlerts().catch((e) => console.warn('[Weather] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedWeatherAlerts().catch((e) => console.warn('[Weather] Seed error:', e?.message || e));
+  }, WEATHER_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// USASpending Seed — federal awards → Redis every 60 min
+// ─────────────────────────────────────────────────────────────
+const SPENDING_SEED_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const SPENDING_REDIS_KEY = 'economic:spending:v1';
+const SPENDING_CACHE_TTL = 3600;
+let spendingSeedInFlight = false;
+
+function getDateDaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toISOString().split('T')[0];
+}
+
+const AWARD_TYPE_MAP = {
+  A: 'contract', B: 'contract', C: 'contract', D: 'contract',
+  '02': 'grant', '03': 'grant', '04': 'grant', '05': 'grant', '06': 'grant', '10': 'grant',
+  '07': 'loan', '08': 'loan',
+};
+
+async function seedUsaSpending() {
+  if (spendingSeedInFlight) return;
+  spendingSeedInFlight = true;
+  const t0 = Date.now();
+  try {
+    const periodStart = getDateDaysAgo(7);
+    const periodEnd = new Date().toISOString().split('T')[0];
+    const resp = await fetch('https://api.usaspending.gov/api/v2/search/spending_by_award/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(20_000),
+      body: JSON.stringify({
+        filters: {
+          time_period: [{ start_date: periodStart, end_date: periodEnd }],
+          award_type_codes: ['A', 'B', 'C', 'D'],
+        },
+        fields: ['Award ID', 'Recipient Name', 'Award Amount', 'Awarding Agency', 'Description', 'Start Date', 'Award Type'],
+        limit: 15, order: 'desc', sort: 'Award Amount',
+      }),
+    });
+    if (!resp.ok) {
+      console.warn(`[Spending] Seed failed: HTTP ${resp.status}`);
+      return;
+    }
+    const data = await resp.json();
+    const results = data.results || [];
+    const awards = results.map((r) => ({
+      id: String(r['Award ID'] || ''),
+      recipientName: String(r['Recipient Name'] || 'Unknown'),
+      amount: Number(r['Award Amount']) || 0,
+      agency: String(r['Awarding Agency'] || 'Unknown'),
+      description: String(r['Description'] || '').slice(0, 200),
+      startDate: String(r['Start Date'] || ''),
+      awardType: AWARD_TYPE_MAP[String(r['Award Type'] || '')] || 'other',
+    }));
+    if (awards.length === 0) {
+      console.warn('[Spending] No awards returned — preserving last good data');
+      return;
+    }
+    const totalAmount = awards.reduce((s, a) => s + a.amount, 0);
+    const payload = { awards, totalAmount, periodStart, periodEnd, fetchedAt: Date.now() };
+    const ok1 = await upstashSet(SPENDING_REDIS_KEY, payload, SPENDING_CACHE_TTL);
+    const ok2 = await upstashSet('seed-meta:economic:spending', { fetchedAt: Date.now(), recordCount: awards.length }, 604800);
+    console.log(`[Spending] Seeded ${awards.length} awards, $${(totalAmount / 1e6).toFixed(1)}M (redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[Spending] Seed error:', e?.message || e);
+  } finally {
+    spendingSeedInFlight = false;
+  }
+}
+
+async function startSpendingSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[Spending] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[Spending] Seed loop starting (interval ${SPENDING_SEED_INTERVAL_MS / 1000 / 60}min)`);
+  seedUsaSpending().catch((e) => console.warn('[Spending] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedUsaSpending().catch((e) => console.warn('[Spending] Seed error:', e?.message || e));
+  }, SPENDING_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tech Events seed — Techmeme ICS + dev.events RSS → Redis
+// Curated major conferences as fallback for events that may
+// fall off limited RSS feeds. Vercel edge can't reach these
+// sources reliably (IP blocking), so Railway fetches them.
+// ─────────────────────────────────────────────────────────────
+
+const TECH_EVENTS_SEED_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6h
+const TECH_EVENTS_TTL_SECONDS = 86400; // 24h safety net
+const TECH_EVENTS_REDIS_KEY = 'research:tech-events:v1';
+const TECH_EVENTS_BOOTSTRAP_KEY = 'research:tech-events-bootstrap:v1';
+const TECH_EVENTS_ICS_URL = 'https://www.techmeme.com/newsy_events.ics';
+const TECH_EVENTS_RSS_URL = 'https://dev.events/rss.xml';
+
+const TECH_EVENTS_CURATED = [
+  { id: 'gitex-global-2026', title: 'GITEX Global 2026', type: 'conference', location: 'Dubai World Trade Centre, Dubai', startDate: '2026-12-07', endDate: '2026-12-11', url: 'https://www.gitex.com', source: 'curated', description: "World's largest tech & startup show" },
+  { id: 'token2049-dubai-2026', title: 'TOKEN2049 Dubai 2026', type: 'conference', location: 'Dubai, UAE', startDate: '2026-04-29', endDate: '2026-04-30', url: 'https://www.token2049.com', source: 'curated', description: 'Premier crypto event in Dubai' },
+  { id: 'collision-2026', title: 'Collision 2026', type: 'conference', location: 'Toronto, Canada', startDate: '2026-06-22', endDate: '2026-06-25', url: 'https://collisionconf.com', source: 'curated', description: "North America's fastest growing tech conference" },
+  { id: 'web-summit-2026', title: 'Web Summit 2026', type: 'conference', location: 'Lisbon, Portugal', startDate: '2026-11-02', endDate: '2026-11-05', url: 'https://websummit.com', source: 'curated', description: "The world's premier tech conference" },
+];
+
+function techEventsParseICS(icsText) {
+  const events = [];
+  const blocks = icsText.split('BEGIN:VEVENT').slice(1);
+  for (const block of blocks) {
+    const summaryMatch = block.match(/SUMMARY:(.+)/);
+    const locationMatch = block.match(/LOCATION:(.+)/);
+    const dtstartMatch = block.match(/DTSTART;VALUE=DATE:(\d+)/);
+    const dtendMatch = block.match(/DTEND;VALUE=DATE:(\d+)/);
+    const urlMatch = block.match(/URL:(.+)/);
+    const uidMatch = block.match(/UID:(.+)/);
+    if (!summaryMatch || !dtstartMatch) continue;
+    const summary = summaryMatch[1].trim();
+    const location = locationMatch ? locationMatch[1].trim() : '';
+    const startDate = dtstartMatch[1];
+    const endDate = dtendMatch ? dtendMatch[1] : startDate;
+    let type = 'other';
+    if (summary.startsWith('Earnings:')) type = 'earnings';
+    else if (summary.startsWith('IPO')) type = 'ipo';
+    else if (location) type = 'conference';
+    events.push({
+      id: uidMatch ? uidMatch[1].trim() : '',
+      title: summary,
+      type,
+      location,
+      startDate: `${startDate.slice(0, 4)}-${startDate.slice(4, 6)}-${startDate.slice(6, 8)}`,
+      endDate: `${endDate.slice(0, 4)}-${endDate.slice(4, 6)}-${endDate.slice(6, 8)}`,
+      url: urlMatch ? urlMatch[1].trim() : '',
+      source: 'techmeme',
+      description: '',
+    });
+  }
+  return events;
+}
+
+function techEventsParseRSS(rssText) {
+  const events = [];
+  const itemMatches = rssText.matchAll(/<item>([\s\S]*?)<\/item>/g);
+  for (const match of itemMatches) {
+    const item = match[1];
+    const titleMatch = item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>|<title>(.*?)<\/title>/);
+    const linkMatch = item.match(/<link>(.*?)<\/link>/);
+    const descMatch = item.match(/<description><!\[CDATA\[(.*?)\]\]><\/description>|<description>(.*?)<\/description>/s);
+    const guidMatch = item.match(/<guid[^>]*>(.*?)<\/guid>/);
+    const title = titleMatch ? (titleMatch[1] ?? titleMatch[2]) : null;
+    if (!title) continue;
+    const link = linkMatch ? linkMatch[1] || '' : '';
+    const description = descMatch ? (descMatch[1] ?? descMatch[2] ?? '') : '';
+    const guid = guidMatch ? guidMatch[1] || '' : '';
+    const dateMatch = description.match(/on\s+(\w+\s+\d{1,2},?\s+\d{4})/i);
+    let startDate = null;
+    if (dateMatch) {
+      const parsed = new Date(dateMatch[1]);
+      if (!isNaN(parsed.getTime())) startDate = parsed.toISOString().split('T')[0];
+    }
+    if (!startDate) continue;
+    if (new Date(startDate) < new Date(new Date().toISOString().split('T')[0])) continue;
+    let location = null;
+    const locMatch = description.match(/(?:in|at)\s+([A-Za-z\s]+,\s*[A-Za-z\s]+)(?:\.|$)/i) ||
+                     description.match(/Location:\s*([^<\n]+)/i);
+    if (locMatch) location = locMatch[1].trim();
+    if (description.toLowerCase().includes('online')) location = 'Online';
+    events.push({
+      id: guid || `dev-events-${title.slice(0, 20)}`,
+      title,
+      type: 'conference',
+      location: location || '',
+      startDate,
+      endDate: startDate,
+      url: link,
+      source: 'dev.events',
+      description: '',
+    });
+  }
+  return events;
+}
+
+function techEventsFetchUrl(url) {
+  return new Promise((resolve) => {
+    const request = https.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        Accept: 'text/calendar, application/rss+xml, application/xml, text/xml, */*',
+      },
+      timeout: 15000,
+    }, (response) => {
+      if ([301, 302, 303, 307, 308].includes(response.statusCode) && response.headers.location) {
+        return techEventsFetchUrl(response.headers.location).then(resolve);
+      }
+      if (response.statusCode !== 200) {
+        resolve(null);
+        response.resume();
+        return;
+      }
+      let data = '';
+      response.on('data', (chunk) => { data += chunk; });
+      response.on('end', () => resolve(data));
+      response.on('error', () => resolve(null));
+    });
+    request.on('error', () => resolve(null));
+    request.on('timeout', () => { request.destroy(); resolve(null); });
+  });
+}
+
+let techEventsSeedInFlight = false;
+
+async function seedTechEvents() {
+  if (techEventsSeedInFlight) return;
+  techEventsSeedInFlight = true;
+  const t0 = Date.now();
+  try {
+    const [icsText, rssText] = await Promise.all([
+      techEventsFetchUrl(TECH_EVENTS_ICS_URL),
+      techEventsFetchUrl(TECH_EVENTS_RSS_URL),
+    ]);
+
+    let events = [];
+    if (icsText) {
+      const parsed = techEventsParseICS(icsText);
+      events.push(...parsed);
+      console.log(`[TechEvents] Techmeme ICS: ${parsed.length} events`);
+    } else {
+      console.warn('[TechEvents] Techmeme ICS fetch failed');
+    }
+    if (rssText) {
+      const parsed = techEventsParseRSS(rssText);
+      events.push(...parsed);
+      console.log(`[TechEvents] dev.events RSS: ${parsed.length} events`);
+    } else {
+      console.warn('[TechEvents] dev.events RSS fetch failed');
+    }
+
+    // Add curated events that are still in the future
+    const today = new Date().toISOString().split('T')[0];
+    for (const curated of TECH_EVENTS_CURATED) {
+      if (curated.startDate >= today) events.push(curated);
+    }
+
+    // Deduplicate by normalized title + year
+    const seen = new Set();
+    events = events.filter((e) => {
+      const year = e.startDate.slice(0, 4);
+      const key = e.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 30) + year;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    // Sort by date
+    events.sort((a, b) => a.startDate.localeCompare(b.startDate));
+
+    if (events.length === 0) {
+      console.warn('[TechEvents] No events from any source — preserving last good data');
+      return;
+    }
+
+    const payload = {
+      success: true,
+      count: events.length,
+      conferenceCount: events.filter((e) => e.type === 'conference').length,
+      mappableCount: 0, // geocoding happens in RPC handler
+      lastUpdated: new Date().toISOString(),
+      events,
+      error: '',
+    };
+
+    const ok1 = await upstashSet(TECH_EVENTS_REDIS_KEY, payload, TECH_EVENTS_TTL_SECONDS);
+    const ok2 = await upstashSet(TECH_EVENTS_BOOTSTRAP_KEY, payload, TECH_EVENTS_TTL_SECONDS);
+    const ok3 = await upstashSet('seed-meta:research:tech-events', { fetchedAt: Date.now(), recordCount: events.length }, 604800);
+    console.log(`[TechEvents] Seeded ${events.length} events (redis: ${ok1 && ok2 && ok3 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.warn('[TechEvents] Seed error:', e?.message || e);
+  } finally {
+    techEventsSeedInFlight = false;
+  }
+}
+
+async function startTechEventsSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[TechEvents] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[TechEvents] Seed loop starting (interval ${TECH_EVENTS_SEED_INTERVAL_MS / 1000 / 60 / 60}h)`);
+  seedTechEvents().catch((e) => console.warn('[TechEvents] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedTechEvents().catch((e) => console.warn('[TechEvents] Seed error:', e?.message || e));
+  }, TECH_EVENTS_SEED_INTERVAL_MS).unref?.();
+}
+
+// ─────────────────────────────────────────────────────────────
+// World Bank Indicators seed loop (tech readiness, progress, renewable)
+// ─────────────────────────────────────────────────────────────
+
+const WB_SEED_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours (data is annual)
+const WB_TTL_SECONDS = 7 * 24 * 3600; // 7 days
+const WB_BOOTSTRAP_KEY = 'economic:worldbank-techreadiness:v1';
+const WB_PROGRESS_KEY = 'economic:worldbank-progress:v1';
+const WB_RENEWABLE_KEY = 'economic:worldbank-renewable:v1';
+
+const WB_WEIGHTS = { internet: 30, mobile: 15, broadband: 20, rdSpend: 35 };
+const WB_NORMALIZE_MAX = { internet: 100, mobile: 150, broadband: 50, rdSpend: 5 };
+
+const WB_INDICATORS = [
+  { key: 'internet',  id: 'IT.NET.USER.ZS', dateRange: '2019:2024' },
+  { key: 'mobile',    id: 'IT.CEL.SETS.P2', dateRange: '2019:2024' },
+  { key: 'broadband', id: 'IT.NET.BBND.P2', dateRange: '2019:2024' },
+  { key: 'rdSpend',   id: 'GB.XPD.RSDV.GD.ZS', dateRange: '2018:2024' },
+];
+
+const WB_PROGRESS_INDICATORS = [
+  { id: 'lifeExpectancy', code: 'SP.DYN.LE00.IN', years: 65, invertTrend: false },
+  { id: 'literacy',       code: 'SE.ADT.LITR.ZS', years: 55, invertTrend: false },
+  { id: 'childMortality', code: 'SH.DYN.MORT',    years: 65, invertTrend: true },
+  { id: 'poverty',        code: 'SI.POV.DDAY',    years: 45, invertTrend: true },
+];
+
+const WB_RENEWABLE_REGIONS = ['1W', 'EAS', 'ECS', 'LCN', 'MEA', 'NAC', 'SAS', 'SSF'];
+const WB_RENEWABLE_REGION_NAMES = {
+  '1W': 'World', EAS: 'East Asia & Pacific', ECS: 'Europe & Central Asia',
+  LCN: 'Latin America & Caribbean', MEA: 'Middle East & N. Africa',
+  NAC: 'North America', SAS: 'South Asia', SSF: 'Sub-Saharan Africa',
+};
+
+function wbFetchJson(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      headers: { 'User-Agent': 'WorldMonitor-Seed/1.0', Accept: 'application/json' },
+      timeout: 30000,
+    }, (resp) => {
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        resp.resume();
+        return reject(new Error(`WB HTTP ${resp.statusCode}`));
+      }
+      let data = '';
+      resp.on('data', (chunk) => { data += chunk; });
+      resp.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('WB timeout')); });
+  });
+}
+
+async function wbFetchIndicator(indicatorId, dateRange) {
+  const baseUrl = `https://api.worldbank.org/v2/country/all/indicator/${indicatorId}`;
+  let page = 1;
+  let totalPages = 1;
+  const allEntries = [];
+
+  while (page <= totalPages) {
+    const url = `${baseUrl}?format=json&date=${dateRange}&per_page=1000&page=${page}`;
+    const raw = await wbFetchJson(url);
+    if (!Array.isArray(raw) || raw.length < 2) break;
+    totalPages = raw[0].pages || 1;
+    if (Array.isArray(raw[1])) allEntries.push(...raw[1]);
+    page++;
+  }
+
+  const latestByCountry = {};
+  for (const entry of allEntries) {
+    if (entry.value === null || entry.value === undefined) continue;
+    const iso3 = entry.countryiso3code;
+    if (!iso3 || iso3.length !== 3) continue;
+    const year = parseInt(entry.date, 10);
+    if (!latestByCountry[iso3] || year > latestByCountry[iso3].year) {
+      latestByCountry[iso3] = { value: entry.value, name: entry.country?.value || iso3, year };
+    }
+  }
+  return latestByCountry;
+}
+
+function wbNormalize(val, max) {
+  if (val === undefined || val === null) return null;
+  return Math.min(100, (val / max) * 100);
+}
+
+function wbComputeRankings(indicatorData) {
+  const allCountries = new Set();
+  for (const data of Object.values(indicatorData)) {
+    Object.keys(data).forEach(c => allCountries.add(c));
+  }
+  const scores = [];
+  for (const cc of allCountries) {
+    const components = {
+      internet:  wbNormalize(indicatorData.internet[cc]?.value, WB_NORMALIZE_MAX.internet),
+      mobile:    wbNormalize(indicatorData.mobile[cc]?.value, WB_NORMALIZE_MAX.mobile),
+      broadband: wbNormalize(indicatorData.broadband[cc]?.value, WB_NORMALIZE_MAX.broadband),
+      rdSpend:   wbNormalize(indicatorData.rdSpend[cc]?.value, WB_NORMALIZE_MAX.rdSpend),
+    };
+    let totalWeight = 0, weightedSum = 0;
+    for (const [key, weight] of Object.entries(WB_WEIGHTS)) {
+      if (components[key] !== null) { weightedSum += components[key] * weight; totalWeight += weight; }
+    }
+    const score = totalWeight > 0 ? weightedSum / totalWeight : 0;
+    const name = indicatorData.internet[cc]?.name || indicatorData.mobile[cc]?.name || cc;
+    scores.push({ country: cc, countryName: name, score: Math.round(score * 10) / 10, rank: 0, components });
+  }
+  scores.sort((a, b) => b.score - a.score);
+  scores.forEach((s, i) => { s.rank = i + 1; });
+  return scores;
+}
+
+async function wbFetchProgress() {
+  const currentYear = new Date().getFullYear();
+  const results = [];
+  for (const ind of WB_PROGRESS_INDICATORS) {
+    const startYear = currentYear - ind.years;
+    const url = `https://api.worldbank.org/v2/country/1W/indicator/${ind.code}?format=json&date=${startYear}:${currentYear}&per_page=1000`;
+    try {
+      const raw = await wbFetchJson(url);
+      if (!Array.isArray(raw) || raw.length < 2 || !Array.isArray(raw[1])) {
+        results.push({ id: ind.id, code: ind.code, data: [], invertTrend: ind.invertTrend });
+        continue;
+      }
+      const data = raw[1]
+        .filter(e => e.value !== null && e.value !== undefined)
+        .map(e => ({ year: parseInt(e.date, 10), value: e.value }))
+        .filter(d => !isNaN(d.year))
+        .sort((a, b) => a.year - b.year);
+      results.push({ id: ind.id, code: ind.code, data, invertTrend: ind.invertTrend });
+    } catch (e) {
+      console.warn(`[WB] Progress ${ind.code} failed:`, e?.message);
+      results.push({ id: ind.id, code: ind.code, data: [], invertTrend: ind.invertTrend });
+    }
+  }
+  return results;
+}
+
+async function wbFetchRenewable() {
+  const currentYear = new Date().getFullYear();
+  const startYear = currentYear - 35;
+  const codes = WB_RENEWABLE_REGIONS.join(';');
+  const url = `https://api.worldbank.org/v2/country/${codes}/indicator/EG.ELC.RNEW.ZS?format=json&date=${startYear}:${currentYear}&per_page=1000`;
+  try {
+    const raw = await wbFetchJson(url);
+    if (!Array.isArray(raw) || raw.length < 2 || !Array.isArray(raw[1])) {
+      return { globalPercentage: 0, globalYear: 0, historicalData: [], regions: [] };
+    }
+    const entries = raw[1].filter(e => e.value !== null && e.value !== undefined);
+    const byRegion = {};
+    for (const e of entries) {
+      const code = e.countryiso3code || e.country?.id;
+      if (!code) continue;
+      if (!byRegion[code]) byRegion[code] = [];
+      byRegion[code].push({ year: parseInt(e.date, 10), value: e.value });
+    }
+    for (const arr of Object.values(byRegion)) arr.sort((a, b) => a.year - b.year);
+
+    const worldData = byRegion['WLD'] || byRegion['1W'] || [];
+    const latest = worldData.length ? worldData[worldData.length - 1] : null;
+    const regions = [];
+    for (const code of WB_RENEWABLE_REGIONS) {
+      if (code === '1W') continue;
+      const rd = byRegion[code] || [];
+      if (!rd.length) continue;
+      const lr = rd[rd.length - 1];
+      regions.push({ code, name: WB_RENEWABLE_REGION_NAMES[code] || code, percentage: lr.value, year: lr.year });
+    }
+    regions.sort((a, b) => b.percentage - a.percentage);
+    return { globalPercentage: latest?.value || 0, globalYear: latest?.year || 0, historicalData: worldData, regions };
+  } catch (e) {
+    console.warn('[WB] Renewable fetch failed:', e?.message);
+    return { globalPercentage: 0, globalYear: 0, historicalData: [], regions: [] };
+  }
+}
+
+async function seedWorldBank() {
+  try {
+    console.log('[WB] Fetching tech readiness indicators...');
+    const indicatorData = {};
+    for (const { key, id, dateRange } of WB_INDICATORS) {
+      indicatorData[key] = await wbFetchIndicator(id, dateRange);
+      console.log(`[WB]   ${id}: ${Object.keys(indicatorData[key]).length} countries`);
+    }
+    const rankings = wbComputeRankings(indicatorData);
+    console.log(`[WB] Rankings: ${rankings.length} countries`);
+
+    console.log('[WB] Fetching progress indicators...');
+    const progressData = await wbFetchProgress();
+    const progressWithData = progressData.filter(p => p.data.length > 0);
+    console.log(`[WB] Progress: ${progressWithData.length}/${progressData.length} with data`);
+
+    console.log('[WB] Fetching renewable energy...');
+    const renewableData = await wbFetchRenewable();
+    console.log(`[WB] Renewable: global=${renewableData.globalPercentage}%, ${renewableData.regions.length} regions`);
+
+    if (rankings.length === 0) {
+      console.warn('[WB] No rankings — aborting seed');
+      return;
+    }
+
+    const metaTtl = WB_TTL_SECONDS + 3600;
+    let ok = await upstashSet(WB_BOOTSTRAP_KEY, rankings, WB_TTL_SECONDS);
+    console.log(`[WB] techReadiness: ${rankings.length} rankings (redis: ${ok ? 'OK' : 'FAIL'})`);
+    await upstashSet(`seed-meta:${WB_BOOTSTRAP_KEY}`, { fetchedAt: Date.now(), recordCount: rankings.length }, metaTtl);
+
+    if (progressWithData.length > 0) {
+      ok = await upstashSet(WB_PROGRESS_KEY, progressData, WB_TTL_SECONDS);
+      console.log(`[WB] progressData: ${progressWithData.length} indicators (redis: ${ok ? 'OK' : 'FAIL'})`);
+      await upstashSet(`seed-meta:${WB_PROGRESS_KEY}`, { fetchedAt: Date.now(), recordCount: progressWithData.length }, metaTtl);
+    }
+
+    if (renewableData.historicalData.length > 0) {
+      ok = await upstashSet(WB_RENEWABLE_KEY, renewableData, WB_TTL_SECONDS);
+      console.log(`[WB] renewableEnergy: ${renewableData.regions.length} regions (redis: ${ok ? 'OK' : 'FAIL'})`);
+      await upstashSet(`seed-meta:${WB_RENEWABLE_KEY}`, { fetchedAt: Date.now(), recordCount: renewableData.historicalData.length }, metaTtl);
+    }
+
+    console.log('[WB] Seed complete');
+  } catch (e) {
+    console.warn('[WB] Seed error:', e?.message || e);
+  }
+}
+
+async function startWorldBankSeedLoop() {
+  if (!UPSTASH_ENABLED) {
+    console.log('[WB] Disabled (no Upstash Redis)');
+    return;
+  }
+  console.log(`[WB] Seed loop starting (interval ${WB_SEED_INTERVAL_MS / 1000 / 60 / 60}h)`);
+  seedWorldBank().catch(e => console.warn('[WB] Initial seed error:', e?.message || e));
+  setInterval(() => {
+    seedWorldBank().catch(e => console.warn('[WB] Seed error:', e?.message || e));
+  }, WB_SEED_INTERVAL_MS).unref?.();
+}
+
 function gzipSyncBuffer(body) {
   try {
     return zlib.gzipSync(typeof body === 'string' ? Buffer.from(body) : body);
@@ -892,7 +3461,15 @@ function gzipSyncBuffer(body) {
   }
 }
 
-function getClientIp(req) {
+function getClientIp(req, isPublic = false) {
+  if (isPublic) {
+    // Public routes: only trust CF-Connecting-IP (set by Cloudflare, not spoofable).
+    // x-real-ip is excluded — client-spoofable on unauthenticated endpoints.
+    const cfIp = req.headers['cf-connecting-ip'];
+    if (typeof cfIp === 'string' && cfIp.trim()) return cfIp.trim();
+    return req.socket?.remoteAddress || 'unknown';
+  }
+  // Authenticated routes: x-real-ip is safe because auth token validates the caller
   const xRealIp = req.headers['x-real-ip'];
   if (typeof xRealIp === 'string' && xRealIp.trim()) {
     return xRealIp.trim();
@@ -900,7 +3477,6 @@ function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (typeof xff === 'string' && xff) {
     const parts = xff.split(',').map((part) => part.trim()).filter(Boolean);
-    // Proxy chain order is client,proxy1,proxy2...; use first hop as client IP.
     if (parts.length > 0) return parts[0];
   }
   return req.socket?.remoteAddress || 'unknown';
@@ -940,6 +3516,7 @@ function getRouteGroup(pathname) {
   if (pathname.startsWith('/ucdp-events')) return 'ucdp-events';
   if (pathname.startsWith('/oref')) return 'oref';
   if (pathname === '/notam') return 'notam';
+  if (pathname === '/yahoo-chart') return 'yahoo-chart';
   return 'other';
 }
 
@@ -950,12 +3527,12 @@ function getRateLimitForPath(pathname) {
   return RELAY_RATE_LIMIT_MAX;
 }
 
-function consumeRateLimit(req, pathname) {
+function consumeRateLimit(req, pathname, isPublic = false) {
   const maxRequests = getRateLimitForPath(pathname);
   if (!Number.isFinite(maxRequests) || maxRequests <= 0) return { limited: false, limit: 0, remaining: 0, resetInMs: 0 };
 
   const now = Date.now();
-  const ip = getClientIp(req);
+  const ip = getClientIp(req, isPublic);
   const key = `${getRouteGroup(pathname)}:${ip}`;
   const existing = requestRateBuckets.get(key);
   if (!existing || now >= existing.resetAt) {
@@ -1283,7 +3860,7 @@ function processRawUpstreamMessage(raw) {
   messageCount++;
   if (messageCount % 5000 === 0) {
     const mem = process.memoryUsage();
-    console.log(`[Relay] ${messageCount} msgs, ${clients.size} ws-clients, ${vessels.size} vessels, queue=${getUpstreamQueueSize()}, dropped=${droppedMessages}, rss=${(mem.rss / 1024 / 1024).toFixed(0)}MB heap=${(mem.heapUsed / 1024 / 1024).toFixed(0)}MB, cache: opensky=${openskyResponseCache.size} opensky_neg=${openskyNegativeCache.size} rss_feed=${rssResponseCache.size}`);
+    console.log(`[Relay] ${messageCount} msgs, ${clients.size} ws-clients, ${vessels.size} vessels, queue=${getUpstreamQueueSize()}, dropped=${droppedMessages}, rss=${(mem.rss / 1024 / 1024).toFixed(0)}MB heap=${(mem.heapUsed / 1024 / 1024).toFixed(0)}MB, cache: opensky=${openskyResponseCache.size} opensky_neg=${openskyNegativeCache.size} rss_feed=${rssResponseCache.size} rss_backoff=${rssFailureCount.size}`);
   }
 
   try {
@@ -1802,9 +4379,25 @@ const OPENSKY_DEDUP_EMPTY_RESPONSE_JSON = JSON.stringify({ states: [], time: 0 }
 const OPENSKY_DEDUP_EMPTY_RESPONSE_GZIP = gzipSyncBuffer(OPENSKY_DEDUP_EMPTY_RESPONSE_JSON);
 const rssResponseCache = new Map(); // key: feed URL → { data, contentType, timestamp, statusCode }
 const rssInFlight = new Map(); // key: feed URL → Promise (dedup concurrent requests)
+const rssFailureCount = new Map(); // key: feed URL → consecutive failure count (for exponential backoff)
+const rssBackoffUntil = new Map(); // key: feed URL → timestamp when backoff expires
 const RSS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 min — RSS feeds rarely update faster
-const RSS_NEGATIVE_CACHE_TTL_MS = 60 * 1000; // 1 min — cache failures to prevent thundering herd
+const RSS_NEGATIVE_CACHE_TTL_MS = 60 * 1000; // 1 min base — scaled by 2^failures via backoff
+const RSS_MAX_NEGATIVE_CACHE_TTL_MS = 15 * 60 * 1000; // 15 min cap — stop hammering broken feeds
 const RSS_CACHE_MAX_ENTRIES = 200; // hard cap — ~20 allowed domains × ~5 paths max, with headroom
+
+function rssRecordFailure(feedUrl) {
+  const prev = rssFailureCount.get(feedUrl) || 0;
+  const ttl = Math.min(RSS_NEGATIVE_CACHE_TTL_MS * Math.pow(2, prev), RSS_MAX_NEGATIVE_CACHE_TTL_MS);
+  rssFailureCount.set(feedUrl, prev + 1);
+  rssBackoffUntil.set(feedUrl, Date.now() + ttl);
+  return { failures: prev + 1, backoffSec: Math.round(ttl / 1000) };
+}
+
+function rssResetFailure(feedUrl) {
+  rssFailureCount.delete(feedUrl);
+  rssBackoffUntil.delete(feedUrl);
+}
 
 function setBoundedCacheEntry(cache, key, value, maxEntries) {
   if (!cache.has(key) && cache.size >= maxEntries) {
@@ -1926,21 +4519,95 @@ async function getOpenSkyToken() {
   }
 }
 
-function _attemptOpenSkyTokenFetch(clientId, clientSecret) {
-  return new Promise((resolve) => {
-    const postData = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`;
+function _openskyProxyConnect(targetHost, targetPort, timeoutMs = 10000) {
+  if (!OPENSKY_PROXY_ENABLED) return Promise.resolve(null);
+  const atIdx = OPENSKY_PROXY_AUTH.lastIndexOf('@');
+  if (atIdx === -1) return Promise.resolve(null);
+  const userPass = OPENSKY_PROXY_AUTH.substring(0, atIdx);
+  const hostPort = OPENSKY_PROXY_AUTH.substring(atIdx + 1);
+  const colonIdx = hostPort.lastIndexOf(':');
+  const proxyHost = hostPort.substring(0, colonIdx);
+  const proxyPort = parseInt(hostPort.substring(colonIdx + 1), 10);
 
+  return new Promise((resolve, reject) => {
+    const connectReq = http.request({
+      host: proxyHost,
+      port: proxyPort,
+      method: 'CONNECT',
+      path: `${targetHost}:${targetPort}`,
+      headers: {
+        'Host': `${targetHost}:${targetPort}`,
+        'Proxy-Authorization': 'Basic ' + Buffer.from(userPass).toString('base64'),
+      },
+      timeout: timeoutMs,
+    });
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        return reject(new Error(`CONNECT ${res.statusCode}`));
+      }
+      const tls = require('tls');
+      const tlsSocket = tls.connect({ socket, servername: targetHost }, () => {
+        resolve(tlsSocket);
+      });
+      tlsSocket.on('error', reject);
+    });
+    connectReq.on('error', reject);
+    connectReq.on('timeout', () => { connectReq.destroy(); reject(new Error('CONNECT timeout')); });
+    connectReq.end();
+  });
+}
+
+function _attemptOpenSkyTokenFetch(clientId, clientSecret) {
+  const postData = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`;
+  const reqHeaders = {
+    'Content-Type': 'application/x-www-form-urlencoded',
+    'Content-Length': Buffer.byteLength(postData),
+    'User-Agent': 'WorldMonitor/1.0',
+  };
+
+  if (OPENSKY_PROXY_ENABLED) {
+    return _openskyProxyConnect('auth.opensky-network.org', 443).then((tlsSocket) => {
+      return new Promise((resolve) => {
+        const req = https.request({
+          socket: tlsSocket,
+          hostname: 'auth.opensky-network.org',
+          path: '/auth/realms/opensky-network/protocol/openid-connect/token',
+          method: 'POST',
+          headers: reqHeaders,
+          timeout: 10000,
+        }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              const json = JSON.parse(data);
+              if (json.access_token) {
+                resolve({ token: json.access_token, expiresIn: json.expires_in || 1800 });
+              } else {
+                resolve({ error: json.error || 'no_access_token', status: res.statusCode });
+              }
+            } catch (e) {
+              resolve({ error: `parse: ${e.message}`, status: res.statusCode });
+            }
+          });
+        });
+        req.on('error', (err) => resolve({ error: `${err.code || 'UNKNOWN'}: ${err.message}` }));
+        req.on('timeout', () => { req.destroy(); resolve({ error: 'TIMEOUT' }); });
+        req.write(postData);
+        req.end();
+      });
+    }).catch((err) => ({ error: `PROXY: ${err.message}` }));
+  }
+
+  return new Promise((resolve) => {
     const req = https.request({
       hostname: 'auth.opensky-network.org',
       port: 443,
       family: 4,
       path: '/auth/realms/opensky-network/protocol/openid-connect/token',
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(postData),
-        'User-Agent': 'WorldMonitor/1.0',
-      },
+      headers: reqHeaders,
       timeout: 10000
     }, (res) => {
       let data = '';
@@ -2009,14 +4676,37 @@ async function _fetchOpenSkyToken(clientId, clientSecret) {
 
 // Promisified upstream OpenSky fetch (single request)
 function _openskyRawFetch(url, token) {
+  const parsed = new URL(url);
+  const reqHeaders = {
+    'Accept': 'application/json',
+    'User-Agent': 'WorldMonitor/1.0',
+    'Authorization': `Bearer ${token}`,
+  };
+
+  if (OPENSKY_PROXY_ENABLED) {
+    return _openskyProxyConnect(parsed.hostname, 443, 15000).then((tlsSocket) => {
+      return new Promise((resolve) => {
+        const request = https.get({
+          socket: tlsSocket,
+          hostname: parsed.hostname,
+          path: parsed.pathname + parsed.search,
+          headers: reqHeaders,
+          timeout: 15000,
+        }, (response) => {
+          let data = '';
+          response.on('data', chunk => data += chunk);
+          response.on('end', () => resolve({ status: response.statusCode || 502, data }));
+        });
+        request.on('error', (err) => resolve({ status: 0, data: null, error: err }));
+        request.on('timeout', () => { request.destroy(); resolve({ status: 504, data: null, error: new Error('timeout') }); });
+      });
+    }).catch((err) => ({ status: 0, data: null, error: new Error(`PROXY: ${err.message}`) }));
+  }
+
   return new Promise((resolve) => {
     const request = https.get(url, {
       family: 4,
-      headers: {
-        'Accept': 'application/json',
-        'User-Agent': 'WorldMonitor/1.0',
-        'Authorization': `Bearer ${token}`,
-      },
+      headers: reqHeaders,
       timeout: 15000,
     }, (response) => {
       let data = '';
@@ -2635,15 +5325,27 @@ setInterval(() => {
     if (now - entry.timestamp > OPENSKY_NEGATIVE_CACHE_TTL_MS * 2) openskyNegativeCache.delete(key);
   }
   for (const [key, entry] of rssResponseCache) {
-    const maxAge = (entry.statusCode && entry.statusCode >= 200 && entry.statusCode < 300)
-      ? RSS_CACHE_TTL_MS * 2 : RSS_NEGATIVE_CACHE_TTL_MS * 2;
-    if (now - entry.timestamp > maxAge) rssResponseCache.delete(key);
+    if (now - entry.timestamp > RSS_CACHE_TTL_MS * 2) rssResponseCache.delete(key);
+  }
+  for (const [key, expiry] of rssBackoffUntil) {
+    // Only clear backoff timer on expiry — preserve failureCount so
+    // the next failure re-escalates immediately instead of resetting to 1min
+    if (now > expiry) rssBackoffUntil.delete(key);
+  }
+  // Clean up failure counts when no backoff is active AND no cache entry exists.
+  // Edge case: if cache is evicted (FIFO/age) right when backoff expires, failureCount
+  // resets — next failure starts at 1min instead of re-escalating. Window is ~60s, acceptable.
+  for (const key of rssFailureCount.keys()) {
+    if (!rssBackoffUntil.has(key) && !rssResponseCache.has(key)) rssFailureCount.delete(key);
   }
   for (const [key, entry] of worldbankCache) {
     if (now - entry.timestamp > WORLDBANK_CACHE_TTL_MS * 2) worldbankCache.delete(key);
   }
   for (const [key, entry] of polymarketCache) {
     if (now - entry.timestamp > POLYMARKET_CACHE_TTL_MS * 2) polymarketCache.delete(key);
+  }
+  for (const [key, entry] of yahooChartCache) {
+    if (now - entry.ts > YAHOO_CHART_CACHE_TTL_MS * 2) yahooChartCache.delete(key);
   }
   for (const [key, bucket] of requestRateBuckets) {
     if (now >= bucket.resetAt + RELAY_RATE_LIMIT_WINDOW_MS * 2) requestRateBuckets.delete(key);
@@ -2653,9 +5355,85 @@ setInterval(() => {
   }
 }, 60 * 1000);
 
+// ── Yahoo Finance Chart Proxy ──────────────────────────────────────
+const YAHOO_CHART_CACHE_TTL_MS = 300_000; // 5 min
+const yahooChartCache = new Map(); // key: symbol:range:interval → { json, gzip, ts }
+const YAHOO_SYMBOL_RE = /^[A-Za-z0-9^=\-\.]{1,15}$/;
+
+function handleYahooChartRequest(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  const symbol = url.searchParams.get('symbol');
+  const range = url.searchParams.get('range') || '1d';
+  const interval = url.searchParams.get('interval') || '1d';
+
+  if (!symbol || !YAHOO_SYMBOL_RE.test(symbol)) {
+    return sendCompressed(req, res, 400, { 'Content-Type': 'application/json' },
+      JSON.stringify({ error: 'Invalid or missing symbol parameter' }));
+  }
+
+  const cacheKey = `${symbol}:${range}:${interval}`;
+  const cached = yahooChartCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < YAHOO_CHART_CACHE_TTL_MS) {
+    return sendCompressed(req, res, 200, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'public, max-age=120, s-maxage=120, stale-while-revalidate=60',
+      'X-Yahoo-Source': 'relay-cache',
+    }, cached.json);
+  }
+
+  const yahooUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}`;
+  const yahooReq = https.get(yahooUrl, {
+    headers: {
+      'User-Agent': CHROME_UA,
+      Accept: 'application/json',
+    },
+    timeout: 10000,
+  }, (upstream) => {
+    let body = '';
+    upstream.on('data', (chunk) => { body += chunk; });
+    upstream.on('end', () => {
+      if (upstream.statusCode !== 200) {
+        logThrottled('warn', `yahoo-chart-upstream-${upstream.statusCode}:${symbol}`,
+          `[Relay] Yahoo chart upstream ${upstream.statusCode} for ${symbol}`);
+        return sendCompressed(req, res, upstream.statusCode || 502, {
+          'Content-Type': 'application/json',
+          'X-Yahoo-Source': 'relay-upstream-error',
+        }, JSON.stringify({ error: `Yahoo upstream ${upstream.statusCode}`, symbol }));
+      }
+      yahooChartCache.set(cacheKey, { json: body, ts: Date.now() });
+      sendCompressed(req, res, 200, {
+        'Content-Type': 'application/json',
+        'Cache-Control': 'public, max-age=120, s-maxage=120, stale-while-revalidate=60',
+        'X-Yahoo-Source': 'relay-upstream',
+      }, body);
+    });
+  });
+  yahooReq.on('error', (err) => {
+    logThrottled('error', `yahoo-chart-error:${symbol}`, `[Relay] Yahoo chart error for ${symbol}: ${err.message}`);
+    if (cached) {
+      return sendCompressed(req, res, 200, {
+        'Content-Type': 'application/json',
+        'X-Yahoo-Source': 'relay-stale',
+      }, cached.json);
+    }
+    sendCompressed(req, res, 502, { 'Content-Type': 'application/json' },
+      JSON.stringify({ error: 'Yahoo upstream error', symbol }));
+  });
+  yahooReq.on('timeout', () => {
+    yahooReq.destroy();
+    if (cached) {
+      return sendCompressed(req, res, 200, {
+        'Content-Type': 'application/json',
+        'X-Yahoo-Source': 'relay-stale',
+      }, cached.json);
+    }
+    sendCompressed(req, res, 504, { 'Content-Type': 'application/json' },
+      JSON.stringify({ error: 'Yahoo upstream timeout', symbol }));
+  });
+}
+
 // ── YouTube Live Detection (residential proxy bypass) ──────────────
 const YOUTUBE_PROXY_URL = process.env.YOUTUBE_PROXY_URL || '';
-const CHROME_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36';
 
 function parseProxyUrl(proxyUrl) {
   if (!proxyUrl) return null;
@@ -2951,6 +5729,11 @@ const ALLOWED_ORIGINS = [
 function getCorsOrigin(req) {
   const origin = req.headers.origin || '';
   if (ALLOWED_ORIGINS.includes(origin)) return origin;
+  // Wildcard: any *.worldmonitor.app subdomain (for variant subdomains)
+  try {
+    const url = new URL(origin);
+    if (url.hostname.endsWith('.worldmonitor.app') && url.protocol === 'https:') return origin;
+  } catch { /* invalid origin — fall through */ }
   // Optional: allow Vercel preview deployments when explicitly enabled.
   if (ALLOW_VERCEL_PREVIEW_ORIGINS && origin.endsWith('.vercel.app')) return origin;
   return '';
@@ -2959,8 +5742,13 @@ function getCorsOrigin(req) {
 const server = http.createServer(async (req, res) => {
   const pathname = (req.url || '/').split('?')[0];
   const corsOrigin = getCorsOrigin(req);
+  // Always emit Vary: Origin on /rss (browser-direct via CDN) to prevent
+  // cached no-CORS responses from being served to browser clients.
+  const isRssRoute = pathname.startsWith('/rss');
   if (corsOrigin) {
     res.setHeader('Access-Control-Allow-Origin', corsOrigin);
+    res.setHeader('Vary', 'Origin');
+  } else if (isRssRoute) {
     res.setHeader('Vary', 'Origin');
   }
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -2976,13 +5764,16 @@ const server = http.createServer(async (req, res) => {
   // served to unauthenticated requests from edge cache. This is acceptable — all proxied data
   // is public (RSS, WorldBank, UCDP, Polymarket, OpenSky, AIS). Auth exists for abuse
   // prevention (rate limiting), not data protection. Cloudflare WAF provides edge-level protection.
-  const isPublicRoute = pathname === '/health' || pathname === '/';
+  const isPublicRoute = pathname === '/health' || pathname === '/' || isRssRoute;
   if (!isPublicRoute) {
     if (!isAuthorizedRequest(req)) {
       return safeEnd(res, 401, { 'Content-Type': 'application/json' },
         JSON.stringify({ error: 'Unauthorized', time: Date.now() }));
     }
-    const rl = consumeRateLimit(req, pathname);
+  }
+  // Rate limiting applies to all non-health routes (including public /rss)
+  if (pathname !== '/health' && pathname !== '/') {
+    const rl = consumeRateLimit(req, pathname, isPublicRoute);
     if (rl.limited) {
       const retryAfterSec = Math.max(1, Math.ceil(rl.resetInMs / 1000));
       return safeEnd(res, 429, {
@@ -3039,6 +5830,7 @@ const server = http.createServer(async (req, res) => {
         ucdp: ucdpCache.data ? 'warm' : 'cold',
         worldbank: worldbankCache.size,
         polymarket: polymarketCache.size,
+        yahooChart: yahooChartCache.size,
         polymarketInflight: polymarketInflight.size,
       },
       auth: {
@@ -3107,7 +5899,7 @@ const server = http.createServer(async (req, res) => {
     const clientId = process.env.OPENSKY_CLIENT_ID;
     const clientSecret = process.env.OPENSKY_CLIENT_SECRET;
 
-    diag.steps.push({ step: 'env_check', hasClientId: !!clientId, hasClientSecret: !!clientSecret });
+    diag.steps.push({ step: 'env_check', hasClientId: !!clientId, hasClientSecret: !!clientSecret, proxyEnabled: OPENSKY_PROXY_ENABLED });
     diag.steps.push({
       step: 'auth_state',
       cachedToken: !!openskyToken,
@@ -3207,31 +5999,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: 'Missing url parameter' }));
       }
 
-      // Allow domains that block Vercel IPs (must match feeds.ts railwayRss usage)
-      const allowedDomains = [
-        // Original
-        'rss.cnn.com',
-        'www.defensenews.com',
-        'layoffs.fyi',
-        // International Organizations
-        'news.un.org',
-        'www.cisa.gov',
-        'www.iaea.org',
-        'www.who.int',
-        'www.crisisgroup.org',
-        // Middle East & Regional News
-        'english.alarabiya.net',
-        'www.arabnews.com',
-        'www.timesofisrael.com',
-        'www.scmp.com',
-        'kyivindependent.com',
-        'www.themoscowtimes.com',
-        // Africa
-        'feeds.24.com',
-        'feeds.capi24.com',  // News24 redirect destination
-        'islandtimes.org',
-        'www.atlanticcouncil.org',
-      ];
+      // Domain allowlist from shared source of truth (shared/rss-allowed-domains.js)
       const parsed = new URL(feedUrl);
       // Block deprecated/stale feed domains — stale clients still request these
       const blockedDomains = ['rsshub.app'];
@@ -3239,12 +6007,33 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(410, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Feed deprecated' }));
       }
-      if (!allowedDomains.includes(parsed.hostname)) {
+      if (!RSS_ALLOWED_DOMAINS.has(parsed.hostname)) {
         res.writeHead(403, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'Domain not allowed on Railway proxy' }));
       }
 
-      // Serve from cache if fresh (5 min for success, 1 min for failures)
+      // Backoff guard: if feed is in exponential backoff, don't hit upstream
+      const backoffExpiry = rssBackoffUntil.get(feedUrl);
+      const backoffNow = Date.now();
+      if (backoffExpiry && backoffNow < backoffExpiry) {
+        const rssCachedForBackoff = rssResponseCache.get(feedUrl);
+        if (rssCachedForBackoff && rssCachedForBackoff.statusCode >= 200 && rssCachedForBackoff.statusCode < 300) {
+          return sendCompressed(req, res, 200, {
+            'Content-Type': rssCachedForBackoff.contentType || 'application/xml',
+            'Cache-Control': 'no-store', 'CDN-Cache-Control': 'no-store',
+            'X-Cache': 'BACKOFF-STALE',
+          }, rssCachedForBackoff.data);
+        }
+        const remainSec = Math.max(1, Math.round((backoffExpiry - backoffNow) / 1000));
+        res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': String(remainSec) });
+        return res.end(JSON.stringify({ error: 'Feed in backoff', retryAfterSec: remainSec }));
+      }
+
+      // Two-layer negative caching:
+      // 1. Backoff guard above: exponential (1→15min) for network errors (socket hang up, timeout)
+      // 2. This cache check: flat 1min TTL for non-2xx upstream responses (429, 503, etc.)
+      // Both layers work correctly together — backoff handles persistent failures,
+      // negative cache prevents thundering herd on transient upstream errors.
       const rssCached = rssResponseCache.get(feedUrl);
       if (rssCached) {
         const ttl = (rssCached.statusCode && rssCached.statusCode >= 200 && rssCached.statusCode < 300)
@@ -3320,6 +6109,10 @@ const server = http.createServer(async (req, res) => {
             const redirectUrl = response.headers.location.startsWith('http')
               ? response.headers.location
               : new URL(response.headers.location, url).href;
+            const redirectHost = new URL(redirectUrl).hostname;
+            if (!RSS_ALLOWED_DOMAINS.has(redirectHost)) {
+              return sendError(403, 'Redirect to disallowed domain');
+            }
             logThrottled('log', `rss-redirect:${feedUrl}:${redirectUrl}`, `[Relay] Following redirect to: ${redirectUrl}`);
             return fetchWithRedirects(redirectUrl, redirectCount + 1);
           }
@@ -3327,6 +6120,7 @@ const server = http.createServer(async (req, res) => {
           if (response.statusCode === 304 && rssCached) {
             responseHandled = true;
             rssCached.timestamp = Date.now();
+            rssResetFailure(feedUrl);
             resolveInFlight();
             logThrottled('log', `rss-revalidated:${feedUrl}`, '[Relay] RSS 304 revalidated:', feedUrl);
             sendCompressed(req, res, 200, {
@@ -3361,8 +6155,11 @@ const server = http.createServer(async (req, res) => {
               etag: response.headers['etag'] || null,
               lastModified: response.headers['last-modified'] || null,
             });
-            if (response.statusCode < 200 || response.statusCode >= 300) {
-              logThrottled('warn', `rss-upstream:${feedUrl}:${response.statusCode}`, `[Relay] RSS upstream ${response.statusCode} for ${feedUrl}`);
+            if (response.statusCode >= 200 && response.statusCode < 300) {
+              rssResetFailure(feedUrl);
+            } else {
+              const { failures, backoffSec } = rssRecordFailure(feedUrl);
+              logThrottled('warn', `rss-upstream:${feedUrl}:${response.statusCode}`, `[Relay] RSS upstream ${response.statusCode} for ${feedUrl} (backoff ${backoffSec}s, failures=${failures})`);
             }
             resolveInFlight();
             sendCompressed(req, res, response.statusCode, {
@@ -3373,15 +6170,17 @@ const server = http.createServer(async (req, res) => {
             }, data);
           });
           stream.on('error', (err) => {
-            logThrottled('error', `rss-decompress:${feedUrl}:${err.code || err.message}`, '[Relay] Decompression error:', err.message);
+            const { failures, backoffSec } = rssRecordFailure(feedUrl);
+            logThrottled('error', `rss-decompress:${feedUrl}:${err.code || err.message}`, `[Relay] Decompression error: ${err.message} (backoff ${backoffSec}s, failures=${failures})`);
             sendError(502, 'Decompression failed: ' + err.message);
           });
         });
 
         request.on('error', (err) => {
-          logThrottled('error', `rss-error:${feedUrl}:${err.code || err.message}`, '[Relay] RSS error:', err.message);
-          // Serve stale on error
-          if (rssCached) {
+          const { failures, backoffSec } = rssRecordFailure(feedUrl);
+          logThrottled('error', `rss-error:${feedUrl}:${err.code || err.message}`, `[Relay] RSS error: ${err.message} (backoff ${backoffSec}s, failures=${failures})`);
+          // Serve stale on error (only if we have previous successful data)
+          if (rssCached && rssCached.statusCode >= 200 && rssCached.statusCode < 300) {
             if (!responseHandled && !res.headersSent) {
               responseHandled = true;
               sendCompressed(req, res, 200, { 'Content-Type': 'application/xml', 'Cache-Control': 'no-store', 'CDN-Cache-Control': 'no-store', 'X-Cache': 'STALE' }, rssCached.data);
@@ -3394,7 +6193,9 @@ const server = http.createServer(async (req, res) => {
 
         request.on('timeout', () => {
           request.destroy();
-          if (rssCached && !responseHandled && !res.headersSent) {
+          const { failures, backoffSec } = rssRecordFailure(feedUrl);
+          logThrottled('warn', `rss-timeout:${feedUrl}`, `[Relay] RSS timeout for ${feedUrl} (backoff ${backoffSec}s, failures=${failures})`);
+          if (rssCached && rssCached.statusCode >= 200 && rssCached.statusCode < 300 && !responseHandled && !res.headersSent) {
             responseHandled = true;
             sendCompressed(req, res, 200, { 'Content-Type': 'application/xml', 'Cache-Control': 'no-store', 'CDN-Cache-Control': 'no-store', 'X-Cache': 'STALE' }, rssCached.data);
             resolveInFlight();
@@ -3449,6 +6250,8 @@ const server = http.createServer(async (req, res) => {
     handlePolymarketRequest(req, res);
   } else if (pathname === '/youtube-live') {
     handleYouTubeLiveRequest(req, res);
+  } else if (pathname === '/yahoo-chart') {
+    handleYahooChartRequest(req, res);
   } else if (pathname === '/notam') {
     handleNotamProxyRequest(req, res);
   } else {
@@ -3560,10 +6363,25 @@ function connectUpstream() {
 const wss = new WebSocketServer({ server });
 
 server.listen(PORT, () => {
-  console.log(`[Relay] WebSocket relay on port ${PORT}`);
+  console.log(`[Relay] WebSocket relay on port ${PORT} (OpenSky: ${OPENSKY_PROXY_ENABLED ? 'via proxy' : 'direct'})`);
   startTelegramPollLoop();
   startOrefPollLoop();
   startUcdpSeedLoop();
+  startMarketDataSeedLoop();
+  startAviationSeedLoop();
+  // Cyber seed disabled — standalone cron seed-cyber-threats.mjs handles this
+  // (avoids burning 12 extra AbuseIPDB calls/day from duplicate relay loop)
+  startCiiWarmPingLoop();
+  startPositiveEventsSeedLoop();
+  startClassifySeedLoop();
+  startServiceStatusesSeedLoop();
+  startTheaterPostureSeedLoop();
+
+  startWeatherSeedLoop();
+  startSpendingSeedLoop();
+  startWorldBankSeedLoop();
+  startSatelliteSeedLoop();
+  startTechEventsSeedLoop();
 });
 
 wss.on('connection', (ws, req) => {
@@ -3610,6 +6428,7 @@ setInterval(() => {
     rssResponseCache.clear();
     polymarketCache.clear();
     worldbankCache.clear();
+    yahooChartCache.clear();
     if (global.gc) global.gc();
   }
 }, 60 * 1000);

@@ -1,3 +1,4 @@
+import { getRpcBaseUrl } from '@/services/rpc-client';
 import {
   ClimateServiceClient,
   type ClimateAnomaly as ProtoClimateAnomaly,
@@ -28,16 +29,16 @@ export interface ClimateFetchResult {
   anomalies: ClimateAnomaly[];
 }
 
-const client = new ClimateServiceClient('', { fetch: (...args) => globalThis.fetch(...args) });
+const client = new ClimateServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
 const breaker = createCircuitBreaker<ListClimateAnomaliesResponse>({ name: 'Climate Anomalies', cacheTtlMs: 10 * 60 * 1000, persistCache: true });
 
 const emptyClimateFallback: ListClimateAnomaliesResponse = { anomalies: [] };
 
 export async function fetchClimateAnomalies(): Promise<ClimateFetchResult> {
   const hydrated = getHydratedData('climateAnomalies') as ListClimateAnomaliesResponse | undefined;
-  if (hydrated) {
-    const anomalies = (hydrated.anomalies ?? []).map(toDisplayAnomaly).filter(a => a.severity !== 'normal');
-    return { ok: true, anomalies };
+  if (hydrated && (hydrated.anomalies ?? []).length > 0) {
+    const anomalies = hydrated.anomalies.map(toDisplayAnomaly).filter(a => a.severity !== 'normal');
+    if (anomalies.length > 0) return { ok: true, anomalies };
   }
 
   const response = await breaker.execute(async () => {

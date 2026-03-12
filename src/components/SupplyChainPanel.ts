@@ -20,7 +20,7 @@ export class SupplyChainPanel extends Panel {
   constructor() {
     super({ id: 'supply-chain', title: t('panels.supplyChain') });
     this.content.addEventListener('click', (e) => {
-      const target = (e.target as HTMLElement).closest('.economic-tab') as HTMLElement | null;
+      const target = (e.target as HTMLElement).closest('.panel-tab') as HTMLElement | null;
       if (!target) return;
       const tabId = target.dataset.tab as TabId;
       if (tabId && tabId !== this.activeTab) {
@@ -47,23 +47,28 @@ export class SupplyChainPanel extends Panel {
 
   private render(): void {
     const tabsHtml = `
-      <div class="economic-tabs">
-        <button class="economic-tab ${this.activeTab === 'chokepoints' ? 'active' : ''}" data-tab="chokepoints">
+      <div class="panel-tabs">
+        <button class="panel-tab ${this.activeTab === 'chokepoints' ? 'active' : ''}" data-tab="chokepoints">
           ${t('components.supplyChain.chokepoints')}
         </button>
-        <button class="economic-tab ${this.activeTab === 'shipping' ? 'active' : ''}" data-tab="shipping">
+        <button class="panel-tab ${this.activeTab === 'shipping' ? 'active' : ''}" data-tab="shipping">
           ${t('components.supplyChain.shipping')}
         </button>
-        <button class="economic-tab ${this.activeTab === 'minerals' ? 'active' : ''}" data-tab="minerals">
+        <button class="panel-tab ${this.activeTab === 'minerals' ? 'active' : ''}" data-tab="minerals">
           ${t('components.supplyChain.minerals')}
         </button>
       </div>
     `;
 
+    const activeHasData = this.activeTab === 'chokepoints'
+      ? (this.chokepointData?.chokepoints?.length ?? 0) > 0
+      : this.activeTab === 'shipping'
+        ? (this.shippingData?.indices?.length ?? 0) > 0
+        : (this.mineralsData?.minerals?.length ?? 0) > 0;
     const activeData = this.activeTab === 'chokepoints' ? this.chokepointData
       : this.activeTab === 'shipping' ? this.shippingData
       : this.mineralsData;
-    const unavailableBanner = activeData?.upstreamUnavailable
+    const unavailableBanner = !activeHasData && activeData?.upstreamUnavailable
       ? `<div class="economic-warning">${t('components.supplyChain.upstreamUnavailable')}</div>`
       : '';
 
@@ -85,7 +90,7 @@ export class SupplyChainPanel extends Panel {
   }
 
   private renderChokepoints(): string {
-    if (!this.chokepointData || this.chokepointData.chokepoints.length === 0) {
+    if (!this.chokepointData || !this.chokepointData.chokepoints?.length) {
       return `<div class="economic-empty">${t('components.supplyChain.noChokepoints')}</div>`;
     }
 
@@ -93,6 +98,7 @@ export class SupplyChainPanel extends Panel {
       ${[...this.chokepointData.chokepoints].sort((a, b) => b.disruptionScore - a.disruptionScore).map(cp => {
         const statusClass = cp.status === 'red' ? 'status-active' : cp.status === 'yellow' ? 'status-notified' : 'status-terminated';
         const statusDot = cp.status === 'red' ? 'sc-dot-red' : cp.status === 'yellow' ? 'sc-dot-yellow' : 'sc-dot-green';
+        const aisDisruptions = cp.aisDisruptions ?? (cp.congestionLevel === 'normal' ? 0 : 1);
         return `<div class="trade-restriction-card">
           <div class="trade-restriction-header">
             <span class="trade-country">${escapeHtml(cp.name)}</span>
@@ -101,7 +107,7 @@ export class SupplyChainPanel extends Panel {
             <span class="trade-status ${statusClass}">${escapeHtml(cp.status)}</span>
           </div>
           <div class="trade-restriction-body">
-            <div class="trade-sector">${cp.activeWarnings} ${t('components.supplyChain.warnings')}</div>
+            <div class="trade-sector">${cp.activeWarnings} ${t('components.supplyChain.warnings')} · ${aisDisruptions} ${t('components.supplyChain.aisDisruptions')}</div>
             <div class="trade-description">${escapeHtml(cp.description)}</div>
             <div class="trade-affected">${escapeHtml(cp.affectedRoutes.join(', '))}</div>
           </div>
@@ -115,7 +121,7 @@ export class SupplyChainPanel extends Panel {
       return `<div class="economic-empty">${t('components.supplyChain.fredKeyMissing')}</div>`;
     }
 
-    if (!this.shippingData || this.shippingData.indices.length === 0) {
+    if (!this.shippingData || !this.shippingData.indices?.length) {
       return `<div class="economic-empty">${t('components.supplyChain.noShipping')}</div>`;
     }
 
@@ -161,7 +167,7 @@ export class SupplyChainPanel extends Panel {
   }
 
   private renderMinerals(): string {
-    if (!this.mineralsData || this.mineralsData.minerals.length === 0) {
+    if (!this.mineralsData || !this.mineralsData.minerals?.length) {
       return `<div class="economic-empty">${t('components.supplyChain.noMinerals')}</div>`;
     }
 

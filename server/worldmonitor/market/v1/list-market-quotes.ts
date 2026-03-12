@@ -8,8 +8,8 @@ import type {
   ListMarketQuotesResponse,
   MarketQuote,
 } from '../../../../src/generated/server/worldmonitor/market/v1/service_server';
-import { YAHOO_ONLY_SYMBOLS, fetchFinnhubQuote, fetchYahooQuotesBatch } from './_shared';
-import { cachedFetchJson } from '../../../_shared/redis';
+import { YAHOO_ONLY_SYMBOLS, fetchFinnhubQuote, fetchYahooQuotesBatch, parseStringArray } from './_shared';
+import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
 
 const REDIS_CACHE_KEY = 'market:quotes:v1';
 const REDIS_CACHE_TTL = 480; // 8 min — shared across all Vercel instances
@@ -30,7 +30,22 @@ export async function listMarketQuotes(
   req: ListMarketQuotesRequest,
 ): Promise<ListMarketQuotesResponse> {
   const now = Date.now();
-  const key = cacheKey(req.symbols);
+  const parsedSymbols = parseStringArray(req.symbols);
+  const key = cacheKey(parsedSymbols);
+
+  // Layer 0: bootstrap/seed data (written by Railway ais-relay)
+  try {
+    const bootstrap = await getCachedJson('market:stocks-bootstrap:v1', true) as ListMarketQuotesResponse | null;
+    if (bootstrap?.quotes?.length) {
+      const symbolSet = new Set(parsedSymbols);
+      const filtered = bootstrap.quotes.filter((q: MarketQuote) => symbolSet.has(q.symbol));
+      if (filtered.length > 0) {
+        const resp: ListMarketQuotesResponse = { quotes: filtered, finnhubSkipped: false, skipReason: '', rateLimited: false };
+        quotesCache.set(key, { data: resp, timestamp: now });
+        return resp;
+      }
+    }
+  } catch {}
 
   // Layer 1: in-memory cache (same instance)
   const memCached = quotesCache.get(key);
@@ -38,12 +53,12 @@ export async function listMarketQuotes(
     return memCached.data;
   }
 
-  const redisKey = redisCacheKey(req.symbols);
+  const redisKey = redisCacheKey(parsedSymbols);
 
   try {
   const result = await cachedFetchJson<ListMarketQuotesResponse>(redisKey, REDIS_CACHE_TTL, async () => {
     const apiKey = process.env.FINNHUB_API_KEY;
-    const symbols = req.symbols;
+    const symbols = parsedSymbols;
     if (!symbols.length) return { quotes: [], finnhubSkipped: !apiKey, skipReason: !apiKey ? 'FINNHUB_API_KEY not configured' : '', rateLimited: false };
 
     const finnhubSymbols = symbols.filter((s) => !YAHOO_ONLY_SYMBOLS.has(s));
@@ -77,10 +92,8 @@ export async function listMarketQuotes(
     const allYahoo = [...yahooSymbols, ...missedFinnhub];
 
     // Fetch Yahoo Finance quotes (staggered to avoid 429)
-    let yahooRateLimited = false;
     if (allYahoo.length > 0) {
       const batch = await fetchYahooQuotesBatch(allYahoo);
-      yahooRateLimited = batch.rateLimited;
       for (const s of allYahoo) {
         if (quotes.some((q) => q.symbol === s)) continue;
         const yahoo = batch.results.get(s);
@@ -103,9 +116,7 @@ export async function listMarketQuotes(
     }
 
     if (quotes.length === 0) {
-      return yahooRateLimited
-        ? { quotes: [], finnhubSkipped: false, skipReason: '', rateLimited: true }
-        : null;
+      return null; // negative cache (120s) — never cache empty results at full TTL
     }
 
     // Only report skipped if Finnhub key missing AND Yahoo fallback didn't cover the gap

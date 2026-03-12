@@ -1,4 +1,5 @@
 import type { Hotspot } from '@/types';
+import { getRpcBaseUrl } from '@/services/rpc-client';
 import { t } from '@/services/i18n';
 import {
   IntelligenceServiceClient,
@@ -124,8 +125,9 @@ export function getIntelTopics(): IntelTopic[] {
 
 // ---- Sebuf client ----
 
-const client = new IntelligenceServiceClient('', { fetch: (...args) => globalThis.fetch(...args) });
+const client = new IntelligenceServiceClient(getRpcBaseUrl(), { fetch: (...args) => globalThis.fetch(...args) });
 const gdeltBreaker = createCircuitBreaker<SearchGdeltDocumentsResponse>({ name: 'GDELT Intelligence', cacheTtlMs: 10 * 60 * 1000, persistCache: true });
+const positiveGdeltBreaker = createCircuitBreaker<SearchGdeltDocumentsResponse>({ name: 'GDELT Positive', cacheTtlMs: 10 * 60 * 1000, persistCache: true });
 
 const emptyGdeltFallback: SearchGdeltDocumentsResponse = { articles: [], query: '', error: '' };
 
@@ -250,7 +252,7 @@ export async function fetchPositiveGdeltArticles(
     return cached.articles;
   }
 
-  const resp = await gdeltBreaker.execute(async () => {
+  const resp = await positiveGdeltBreaker.execute(async () => {
     return client.searchGdeltDocuments({
       query,
       maxRecords: maxrecords,

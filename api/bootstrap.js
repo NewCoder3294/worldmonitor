@@ -7,6 +7,8 @@ const BOOTSTRAP_CACHE_KEYS = {
   earthquakes:      'seismology:earthquakes:v1',
   outages:          'infra:outages:v1',
   serviceStatuses:  'infra:service-statuses:v1',
+  marketQuotes:     'market:stocks-bootstrap:v1',
+  commodityQuotes:  'market:commodities-bootstrap:v1',
   sectors:          'market:sectors:v1',
   etfFlows:         'market:etf-flows:v1',
   macroSignals:     'economic:macro-signals:v1',
@@ -14,12 +16,55 @@ const BOOTSTRAP_CACHE_KEYS = {
   bisExchange:      'economic:bis:eer:v1',
   bisCredit:        'economic:bis:credit:v1',
   shippingRates:    'supply_chain:shipping:v2',
-  chokepoints:      'supply_chain:chokepoints:v1',
-  minerals:         'supply_chain:minerals:v1',
+  chokepoints:      'supply_chain:chokepoints:v2',
+  minerals:         'supply_chain:minerals:v2',
   giving:           'giving:summary:v1',
   climateAnomalies: 'climate:anomalies:v1',
   wildfires:        'wildfire:fires:v1',
-  ucdpEvents:       'conflict:ucdp-events:v1',
+  cyberThreats:     'cyber:threats-bootstrap:v2',
+  techReadiness:    'economic:worldbank-techreadiness:v1',
+  progressData:     'economic:worldbank-progress:v1',
+  renewableEnergy:  'economic:worldbank-renewable:v1',
+  positiveGeoEvents: 'positive-events:geo-bootstrap:v1',
+  theaterPosture: 'theater-posture:sebuf:stale:v1',
+  riskScores: 'risk:scores:sebuf:stale:v1',
+  naturalEvents: 'natural:events:v1',
+  flightDelays: 'aviation:delays-bootstrap:v1',
+  insights: 'news:insights:v1',
+  predictions: 'prediction:markets-bootstrap:v1',
+  cryptoQuotes: 'market:crypto:v1',
+  gulfQuotes: 'market:gulf-quotes:v1',
+  stablecoinMarkets: 'market:stablecoins:v1',
+  unrestEvents: 'unrest:events:v1',
+  iranEvents: 'conflict:iran-events:v1',
+  ucdpEvents: 'conflict:ucdp-events:v1',
+  temporalAnomalies: 'temporal:anomalies:v1',
+  weatherAlerts:     'weather:alerts:v1',
+  spending:          'economic:spending:v1',
+  techEvents:        'research:tech-events-bootstrap:v1',
+};
+
+const SLOW_KEYS = new Set([
+  'bisPolicy', 'bisExchange', 'bisCredit', 'minerals', 'giving',
+  'sectors', 'etfFlows', 'shippingRates', 'wildfires', 'climateAnomalies',
+  'cyberThreats', 'techReadiness', 'progressData', 'renewableEnergy',
+  'naturalEvents',
+  'cryptoQuotes', 'gulfQuotes', 'stablecoinMarkets', 'unrestEvents', 'ucdpEvents',
+  'techEvents',
+]);
+const FAST_KEYS = new Set([
+  'earthquakes', 'outages', 'serviceStatuses', 'macroSignals', 'chokepoints',
+  'marketQuotes', 'commodityQuotes', 'positiveGeoEvents', 'riskScores', 'flightDelays','insights', 'predictions',
+  'iranEvents', 'temporalAnomalies', 'weatherAlerts', 'spending', 'theaterPosture',
+]);
+
+const TIER_CACHE = {
+  slow: 'public, s-maxage=3600, stale-while-revalidate=600, stale-if-error=3600',
+  fast: 'public, s-maxage=600, stale-while-revalidate=120, stale-if-error=900',
+};
+const TIER_CDN_CACHE = {
+  slow: 'public, s-maxage=7200, stale-while-revalidate=1800, stale-if-error=7200',
+  fast: 'public, s-maxage=600, stale-while-revalidate=120, stale-if-error=900',
 };
 
 const NEG_SENTINEL = '__WM_NEG__';
@@ -72,10 +117,17 @@ export default async function handler(req) {
     });
 
   const url = new URL(req.url);
-  const requested = url.searchParams.get('keys')?.split(',').filter(Boolean);
-  const registry = requested
-    ? Object.fromEntries(Object.entries(BOOTSTRAP_CACHE_KEYS).filter(([k]) => requested.includes(k)))
-    : BOOTSTRAP_CACHE_KEYS;
+  const tier = url.searchParams.get('tier');
+  let registry;
+  if (tier === 'slow' || tier === 'fast') {
+    const tierSet = tier === 'slow' ? SLOW_KEYS : FAST_KEYS;
+    registry = Object.fromEntries(Object.entries(BOOTSTRAP_CACHE_KEYS).filter(([k]) => tierSet.has(k)));
+  } else {
+    const requested = url.searchParams.get('keys')?.split(',').filter(Boolean).sort();
+    registry = requested
+      ? Object.fromEntries(Object.entries(BOOTSTRAP_CACHE_KEYS).filter(([k]) => requested.includes(k)))
+      : BOOTSTRAP_CACHE_KEYS;
+  }
 
   const keys = Object.values(registry);
   const names = Object.keys(registry);
@@ -98,12 +150,15 @@ export default async function handler(req) {
     else missing.push(names[i]);
   }
 
+  const cacheControl = (tier && TIER_CACHE[tier]) || 'public, s-maxage=600, stale-while-revalidate=120, stale-if-error=900';
+
   return new Response(JSON.stringify({ data, missing }), {
     status: 200,
     headers: {
       ...cors,
       'Content-Type': 'application/json',
-      'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=120, stale-if-error=900',
+      'Cache-Control': cacheControl,
+      'CDN-Cache-Control': (tier && TIER_CDN_CACHE[tier]) || TIER_CDN_CACHE.fast,
     },
   });
 }

@@ -47,6 +47,7 @@ export class StrategicPosturePanel extends Panel {
     if (!this.isPanelVisible() || this.postures.length === 0) return;
     console.log('[StrategicPosturePanel] Re-augmenting with vessels...');
     await this.augmentWithVessels();
+    if (!this.element?.isConnected) return;
     this.render();
   }
 
@@ -125,7 +126,8 @@ export class StrategicPosturePanel extends Panel {
       // Fetch aircraft data from server
       this.showLoadingStage('aircraft');
       const data = await fetchCachedTheaterPosture(this.signal);
-      if (!data || data.postures.length === 0) {
+      if (!this.element?.isConnected) return;
+      if (!data || !data.postures?.length) {
         this.showNoData();
         return;
       }
@@ -141,6 +143,7 @@ export class StrategicPosturePanel extends Panel {
       // Try to augment with vessel data (client-side)
       this.showLoadingStage('vessels');
       await this.augmentWithVessels();
+      if (!this.element?.isConnected) return;
 
       this.showLoadingStage('analysis');
       this.updateBadges();
@@ -263,7 +266,7 @@ export class StrategicPosturePanel extends Panel {
   }
 
   public updatePostures(data: CachedTheaterPosture): void {
-    if (!data || data.postures.length === 0) {
+    if (!data || !data.postures?.length) {
       this.showNoData();
       return;
     }
@@ -275,6 +278,7 @@ export class StrategicPosturePanel extends Panel {
     this.lastTimestamp = data.timestamp;
     this.isStale = data.stale || false;
     this.augmentWithVessels().then(() => {
+      if (!this.element?.isConnected) return;
       this.updateBadges();
       this.render();
     });
@@ -316,11 +320,11 @@ export class StrategicPosturePanel extends Panel {
               <span>${t('components.strategicPosture.aisVesselStream')}</span>
             </div>
           </div>
-          <button class="posture-retry-btn">↻ ${t('components.strategicPosture.retryNow')}</button>
+          <button class="posture-retry-btn" data-panel-retry>↻ ${t('components.strategicPosture.retryNow')}</button>
         </div>
       </div>
     `);
-    this.content.querySelector('.posture-retry-btn')?.addEventListener('click', () => this.refresh());
+    this.setRetryCallback(() => this.refresh());
   }
 
   private showFetchError(): void {
@@ -336,11 +340,11 @@ export class StrategicPosturePanel extends Panel {
           <div class="posture-error-hint">
             <strong>${t('components.strategicPosture.rateLimitedTip')}</strong>
           </div>
-          <button class="posture-retry-btn">↻ ${t('components.strategicPosture.tryAgain')}</button>
+          <button class="posture-retry-btn" data-panel-retry>↻ ${t('components.strategicPosture.tryAgain')}</button>
         </div>
       </div>
     `);
-    this.content.querySelector('.posture-retry-btn')?.addEventListener('click', () => this.refresh());
+    this.setRetryCallback(() => this.refresh());
   }
 
   private getPostureBadge(level: string): string {
@@ -463,7 +467,7 @@ export class StrategicPosturePanel extends Panel {
 
         <div class="posture-footer">
           <span class="posture-updated">${this.isStale ? '⚠️ ' : ''}${t('components.strategicPosture.updated')} ${updatedTime}</span>
-          <button class="posture-refresh-btn" title="${t('components.strategicPosture.refresh')}">↻</button>
+          <button class="posture-refresh-btn" title="${t('components.strategicPosture.refresh')}" aria-label="${t('components.strategicPosture.refresh')}">↻</button>
         </div>
       </div>
     `;

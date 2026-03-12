@@ -288,8 +288,8 @@ export function clusterNewsCore(
       sourceCount: cluster.length,
       topSources,
       allItems: cluster,
-      firstSeen: new Date(Math.min(...dates)),
-      lastUpdated: new Date(Math.max(...dates)),
+      firstSeen: new Date(dates.reduce((min, d) => d < min ? d : min)),
+      lastUpdated: new Date(dates.reduce((max, d) => d > max ? d : max)),
       isAlert: cluster.some(i => i.isAlert),
       monitorColor: cluster.find(i => i.monitorColor)?.monitorColor,
       threat,
@@ -327,6 +327,17 @@ function averageVelocity(history: TopicVelocityPoint[]): number {
   if (history.length === 0) return 0;
   const total = history.reduce((sum, point) => sum + point.velocity, 0);
   return total / history.length;
+}
+
+function countRelatedTopicMentions(
+  newsTopics: Map<string, number>,
+  market: Pick<MarketDataCore, 'name' | 'symbol'>
+): number {
+  const marketNameLower = market.name.toLowerCase();
+  const marketSymbolLower = market.symbol.toLowerCase();
+  return Array.from(newsTopics.entries())
+    .filter(([topic]) => marketNameLower.includes(topic) || topic.includes(marketSymbolLower))
+    .reduce((sum, [, velocity]) => sum + velocity, 0);
 }
 
 export function detectPipelineFlowDrops(
@@ -615,9 +626,7 @@ export function analyzeCorrelationsCore(
         });
       }
     } else {
-      const oldRelatedNews = Array.from(newsTopics.entries())
-        .filter(([k]) => market.name.toLowerCase().includes(k) || k.includes(market.symbol.toLowerCase()))
-        .reduce((sum, [, v]) => sum + v, 0);
+      const oldRelatedNews = countRelatedTopicMentions(newsTopics, market);
 
       const dedupeKey = generateDedupeKey('silent_divergence', market.symbol, change);
       if (oldRelatedNews < 2 && !isRecentDuplicate(dedupeKey)) {
@@ -648,9 +657,7 @@ export function analyzeCorrelationsCore(
 
     const change = market.change ?? 0;
     if (change >= FLOW_PRICE_THRESHOLD) {
-      const relatedNews = Array.from(newsTopics.entries())
-        .filter(([k]) => market.name.toLowerCase().includes(k) || k.includes(market.symbol.toLowerCase()))
-        .reduce((sum, [, v]) => sum + v, 0);
+      const relatedNews = countRelatedTopicMentions(newsTopics, market);
 
       const dedupeKey = generateDedupeKey('flow_price_divergence', market.symbol, change);
       if (relatedNews < 2 && pipelineFlowMentions === 0 && !isRecentDuplicate(dedupeKey)) {

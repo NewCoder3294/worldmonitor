@@ -1,4 +1,4 @@
-import { isDesktopRuntime } from '@/services/runtime';
+import { isDesktopRuntime, toApiUrl } from '@/services/runtime';
 
 type MapView = 'global' | 'america' | 'mena' | 'eu' | 'asia' | 'latam' | 'africa' | 'oceania';
 
@@ -83,7 +83,7 @@ let _countryPromise: Promise<string | null> | undefined;
 async function resolveCountryCodeInternal(): Promise<string | null> {
   if (!isDesktopRuntime()) {
     try {
-      const res = await fetch('/api/geo', { signal: AbortSignal.timeout(3000) });
+      const res = await fetch(toApiUrl('/api/geo'), { signal: AbortSignal.timeout(3000) });
       if (res.ok) {
         const data = await res.json();
         if (data.country && data.country !== 'XX') return data.country;
@@ -102,6 +102,18 @@ async function resolveCountryCodeInternal(): Promise<string | null> {
 export function resolveUserCountryCode(): Promise<string | null> {
   if (!_countryPromise) _countryPromise = resolveCountryCodeInternal();
   return _countryPromise;
+}
+
+export interface PreciseCoordinates {
+  lat: number;
+  lon: number;
+}
+
+export function resolvePreciseUserCoordinates(timeout = 5000): Promise<PreciseCoordinates | null> {
+  if (typeof navigator === 'undefined' || !navigator.geolocation) return Promise.resolve(null);
+  return getGeolocationPosition(timeout)
+    .then(pos => ({ lat: pos.coords.latitude, lon: pos.coords.longitude }))
+    .catch(() => null);
 }
 
 export async function resolveUserRegion(): Promise<MapView> {

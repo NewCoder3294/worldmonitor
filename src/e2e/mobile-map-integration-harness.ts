@@ -86,6 +86,8 @@ window.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 
 const layers = {
   gpsJamming: false,
+  satellites: false,
+
   conflicts: false,
   bases: false,
   cables: false,
@@ -128,7 +130,12 @@ const layers = {
   renewableInstallations: false,
   tradeRoutes: false,
   iranAttacks: false,
+
+  ciiChoropleth: false,
   dayNight: false,
+  miningSites: false,
+  processingPlants: false,
+  commodityPorts: false,
 };
 
 await initI18n();

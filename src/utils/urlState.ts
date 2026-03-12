@@ -35,6 +35,8 @@ const LAYER_KEYS: (keyof MapLayers)[] = [
   'tradeRoutes',
   'iranAttacks',
   'gpsJamming',
+  'satellites',
+  'ciiChoropleth',
 ];
 
 const TIME_RANGES: TimeRange[] = ['1h', '6h', '24h', '48h', '7d', 'all'];
@@ -97,6 +99,10 @@ export function parseMapUrlState(
           .map((layer) => layer.trim())
           .filter(Boolean)
       );
+      if (requested.has('satelliteImagery')) {
+        requested.delete('satelliteImagery');
+        requested.add('satellites');
+      }
       LAYER_KEYS.forEach((key) => {
         layers![key] = requested.has(key);
       });

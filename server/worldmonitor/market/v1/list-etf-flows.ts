@@ -11,7 +11,8 @@ import type {
 } from '../../../../src/generated/server/worldmonitor/market/v1/service_server';
 import { UPSTREAM_TIMEOUT_MS, type YahooChartResponse } from './_shared';
 import { CHROME_UA, yahooGate } from '../../../_shared/constants';
-import { cachedFetchJson } from '../../../_shared/redis';
+import { cachedFetchJson, getCachedJson } from '../../../_shared/redis';
+import etfConfig from '../../../../shared/etfs.json';
 
 // ========================================================================
 // Constants and cache
@@ -20,18 +21,9 @@ import { cachedFetchJson } from '../../../_shared/redis';
 const REDIS_CACHE_KEY = 'market:etf-flows:v1';
 const REDIS_CACHE_TTL = 600; // 10 min — daily volume data, slow-moving
 
-const ETF_LIST = [
-  { ticker: 'IBIT', issuer: 'BlackRock' },
-  { ticker: 'FBTC', issuer: 'Fidelity' },
-  { ticker: 'ARKB', issuer: 'ARK/21Shares' },
-  { ticker: 'BITB', issuer: 'Bitwise' },
-  { ticker: 'GBTC', issuer: 'Grayscale' },
-  { ticker: 'HODL', issuer: 'VanEck' },
-  { ticker: 'BRRR', issuer: 'Valkyrie' },
-  { ticker: 'EZBC', issuer: 'Franklin' },
-  { ticker: 'BTCO', issuer: 'Invesco' },
-  { ticker: 'BTCW', issuer: 'WisdomTree' },
-];
+const ETF_LIST = etfConfig.btcSpot;
+
+const SEED_FRESHNESS_MS = 90 * 60_000; // 90 min — Railway seeds every hour
 
 let etfCache: ListEtfFlowsResponse | null = null;
 let etfCacheTimestamp = 0;
@@ -113,6 +105,22 @@ export async function listEtfFlows(
   if (etfCache && now - etfCacheTimestamp < ETF_CACHE_TTL) {
     return etfCache;
   }
+
+  try {
+    const [seedData, seedMeta] = await Promise.all([
+      getCachedJson(REDIS_CACHE_KEY, true) as Promise<ListEtfFlowsResponse | null>,
+      getCachedJson('seed-meta:market:etf-flows', true) as Promise<{ fetchedAt?: number } | null>,
+    ]);
+    if (seedData?.etfs?.length) {
+      const fetchedAt = seedMeta?.fetchedAt ?? 0;
+      const isFresh = now - fetchedAt < SEED_FRESHNESS_MS;
+      if (isFresh || !process.env.SEED_FALLBACK_ETF) {
+        etfCache = seedData;
+        etfCacheTimestamp = now;
+        return seedData;
+      }
+    }
+  } catch { /* fall through to live fetch */ }
 
   try {
   const result = await cachedFetchJson<ListEtfFlowsResponse>(REDIS_CACHE_KEY, REDIS_CACHE_TTL, async () => {

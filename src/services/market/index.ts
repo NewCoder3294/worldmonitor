@@ -5,6 +5,7 @@
  * All data now flows through the MarketServiceClient RPCs.
  */
 
+import { getRpcBaseUrl } from '@/services/rpc-client';
 import {
   MarketServiceClient,
   type ListMarketQuotesResponse,
@@ -14,11 +15,13 @@ import {
 } from '@/generated/client/worldmonitor/market/v1/service_client';
 import type { MarketData, CryptoData } from '@/types';
 import { createCircuitBreaker } from '@/utils';
+import { getHydratedData } from '@/services/bootstrap';
 
 // ---- Client + Circuit Breakers ----
 
-const client = new MarketServiceClient('', { fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args) });
+const client = new MarketServiceClient(getRpcBaseUrl(), { fetch: (...args: Parameters<typeof fetch>) => globalThis.fetch(...args) });
 const stockBreaker = createCircuitBreaker<ListMarketQuotesResponse>({ name: 'Market Quotes', cacheTtlMs: 0 });
+const commodityBreaker = createCircuitBreaker<ListMarketQuotesResponse>({ name: 'Commodity Quotes', cacheTtlMs: 0 });
 const cryptoBreaker = createCircuitBreaker<ListCryptoQuotesResponse>({ name: 'Crypto Quotes' });
 
 const emptyStockFallback: ListMarketQuotesResponse = { quotes: [], finnhubSkipped: false, skipReason: '', rateLimited: false };
@@ -70,14 +73,14 @@ function symbolSetKey(symbols: string[]): string {
 
 export async function fetchMultipleStocks(
   symbols: Array<{ symbol: string; name: string; display: string }>,
-  options: { onBatch?: (results: MarketData[]) => void } = {},
+  options: { onBatch?: (results: MarketData[]) => void; useCommodityBreaker?: boolean } = {},
 ): Promise<MarketFetchResult> {
-  // All symbols go through listMarketQuotes (handler handles Yahoo vs Finnhub routing internally)
   const allSymbolStrings = symbols.map((s) => s.symbol);
   const setKey = symbolSetKey(allSymbolStrings);
   const symbolMetaMap = new Map(symbols.map((s) => [s.symbol, s]));
 
-  const resp = await stockBreaker.execute(async () => {
+  const breaker = options.useCommodityBreaker ? commodityBreaker : stockBreaker;
+  const resp = await breaker.execute(async () => {
     return client.listMarketQuotes({ symbols: allSymbolStrings });
   }, emptyStockFallback);
 
@@ -120,6 +123,12 @@ export async function fetchStockQuote(
 let lastSuccessfulCrypto: CryptoData[] = [];
 
 export async function fetchCrypto(): Promise<CryptoData[]> {
+  const hydrated = getHydratedData('cryptoQuotes') as ListCryptoQuotesResponse | undefined;
+  if (hydrated?.quotes?.length) {
+    const mapped = hydrated.quotes.map(toCryptoData).filter(c => c.price > 0);
+    if (mapped.length > 0) { lastSuccessfulCrypto = mapped; return mapped; }
+  }
+
   const resp = await cryptoBreaker.execute(async () => {
     return client.listCryptoQuotes({ ids: [] }); // empty = all defaults
   }, emptyCryptoFallback);
