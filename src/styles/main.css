@@ -58,6 +58,14 @@
   --font-body: var(--font-mono);
 }
 
+/* System font override via data attribute (not inline style)
+   so that [dir="rtl"] / :lang() rules later in the cascade win. */
+[data-font="system"] {
+  --font-body: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* RTL / CJK font stacks — these come after [data-font] so they
+   naturally override for their respective scripts. */
 [dir="rtl"] {
   --font-body: 'Geeza Pro', 'SF Arabic', 'Tahoma', system-ui, sans-serif;
 }

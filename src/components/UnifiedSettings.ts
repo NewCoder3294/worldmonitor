@@ -5,6 +5,8 @@ import { LANGUAGES, changeLanguage, getCurrentLanguage, t } from '@/services/i18
 import { getAiFlowSettings, setAiFlowSetting, getStreamQuality, setStreamQuality, STREAM_QUALITY_OPTIONS } from '@/services/ai-flow-settings';
 import type { StreamQuality } from '@/services/ai-flow-settings';
 import { escapeHtml } from '@/utils/sanitize';
+import { getCurrentFont, setFont } from '@/utils/font-manager';
+import type { FontPreference } from '@/utils/font-manager';
 import { trackLanguageChange } from '@/services/analytics';
 import type { PanelConfig } from '@/types';
 import type { StatusPanel } from './StatusPanel';
@@ -154,6 +156,12 @@ export class UnifiedSettings {
       // Stream quality select
       if (target.id === 'us-stream-quality') {
         setStreamQuality(target.value as StreamQuality);
+        return;
+      }
+
+      // Font select
+      if (target.id === 'us-font-select') {
+        setFont(target.value as FontPreference);
         return;
       }
 
@@ -339,6 +347,20 @@ export class UnifiedSettings {
       const selected = opt.value === currentQuality ? ' selected' : '';
       html += `<option value="${opt.value}"${selected}>${opt.label}</option>`;
     }
+    html += `</select>`;
+
+    // Font section
+    const currentFont = getCurrentFont();
+    html += `<div class="ai-flow-section-label">${t('components.insights.sectionFont')}</div>`;
+    html += `<div class="ai-flow-toggle-row">
+      <div class="ai-flow-toggle-label-wrap">
+        <div class="ai-flow-toggle-label">${t('components.insights.fontLabel')}</div>
+        <div class="ai-flow-toggle-desc">${t('components.insights.fontDesc')}</div>
+      </div>
+    </div>`;
+    html += `<select class="unified-settings-lang-select" id="us-font-select">`;
+    html += `<option value="mono"${currentFont === 'mono' ? ' selected' : ''}>${t('components.insights.fontMono')}</option>`;
+    html += `<option value="system"${currentFont === 'system' ? ' selected' : ''}>${t('components.insights.fontSystem')}</option>`;
     html += `</select>`;
 
     // Language section

@@ -1086,7 +1086,12 @@
     "badgeAnimDesc": "Animate update badges on panel headers",
     "sectionIntelligence": "Intelligence",
     "headlineMemoryLabel": "Headline Memory",
-    "headlineMemoryDesc": "Remember seen headlines to highlight new stories"
+    "headlineMemoryDesc": "Remember seen headlines to highlight new stories",
+    "sectionFont": "Font",
+    "fontLabel": "Font Family",
+    "fontDesc": "Choose between monospace and system default fonts",
+    "fontMono": "Monospace (Default)",
+    "fontSystem": "System Default"
     },
     "cascade": {
       "noImpacts": "No country impacts detected",
