@@ -28,6 +28,10 @@ export interface CircuitBreakerOptions {
   persistCache?: boolean;
   /** Maximum in-memory cache entries before LRU eviction. Default: 256. */
   maxCacheEntries?: number;
+  /** Override the global 24h persistent stale ceiling for this breaker.
+   *  Persistent entries older than this are discarded during hydration.
+   *  Useful for time-sensitive data (e.g. risk scores → 1h). */
+  persistentStaleCeilingMs?: number;
 }
 
 const DEFAULT_MAX_FAILURES = 2;
@@ -56,6 +60,7 @@ export class CircuitBreaker<T> {
   private lastDataState: BreakerDataState = { mode: 'unavailable', timestamp: null, offline: false };
   private backgroundRefreshPromises = new Map<string, Promise<void>>();
   private maxCacheEntries: number;
+  private persistentStaleCeilingMs: number;
 
   constructor(options: CircuitBreakerOptions) {
     this.name = options.name;
@@ -66,6 +71,7 @@ export class CircuitBreaker<T> {
       ? false
       : (options.persistCache ?? false);
     this.maxCacheEntries = options.maxCacheEntries ?? DEFAULT_MAX_CACHE_ENTRIES;
+    this.persistentStaleCeilingMs = options.persistentStaleCeilingMs ?? PERSISTENT_STALE_CEILING_MS;
   }
 
   private resolveCacheKey(cacheKey?: string): string {
@@ -143,7 +149,7 @@ export class CircuitBreaker<T> {
         if (entry == null || entry.data === undefined || entry.data === null) return;
 
         const age = Date.now() - entry.updatedAt;
-        if (age > PERSISTENT_STALE_CEILING_MS) return;
+        if (age > this.persistentStaleCeilingMs) return;
 
         // Only hydrate if in-memory cache is empty (don't overwrite live data)
         if (this.getCacheEntry(cacheKey) === null) {
