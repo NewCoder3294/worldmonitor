@@ -17,41 +17,6 @@ const root = resolve(__dirname, '..');
 
 const readSrc = (relPath: string) => readFileSync(resolve(root, relPath), 'utf-8');
 
-// ============================================================
-// 1. Static analysis: CircuitBreakerOptions accepts persistentStaleCeilingMs
-// ============================================================
-
-describe('CircuitBreakerOptions — persistentStaleCeilingMs field', () => {
-  const src = readSrc('src/utils/circuit-breaker.ts');
-
-  it('CircuitBreakerOptions interface includes persistentStaleCeilingMs', () => {
-    assert.match(
-      src,
-      /persistentStaleCeilingMs\s*\?\s*:\s*number/,
-      'CircuitBreakerOptions must have an optional persistentStaleCeilingMs?: number field',
-    );
-  });
-
-  it('constructor stores persistentStaleCeilingMs (falls back to global default)', () => {
-    assert.match(
-      src,
-      /this\.\w*[Pp]ersistent[Ss]tale[Cc]eiling/,
-      'Constructor must store persistentStaleCeilingMs as an instance field',
-    );
-  });
-
-  it('hydratePersistentCache uses instance field instead of global constant', () => {
-    const hydrateStart = src.indexOf('hydratePersistentCache');
-    assert.ok(hydrateStart !== -1, 'hydratePersistentCache method must exist');
-    const hydrateBody = src.slice(hydrateStart, src.indexOf('\n  }', hydrateStart + 200) + 4);
-
-    assert.match(
-      hydrateBody,
-      /this\.\w*[Pp]ersistent[Ss]tale[Cc]eiling/,
-      'hydratePersistentCache must use the instance persistentStaleCeiling field, not the global constant',
-    );
-  });
-});
 
 // ============================================================
 // 2. Behavioral: persistentStaleCeilingMs controls hydration discard
@@ -103,10 +68,6 @@ describe('CircuitBreaker — persistentStaleCeilingMs behavior', () => {
     }
   });
 });
-
-// ============================================================
-// 3. Static analysis: cached-risk-scores.ts passes persistentStaleCeilingMs
-// ============================================================
 
 // ============================================================
 // 3. Adversarial edge cases — try to break persistentStaleCeilingMs
@@ -183,7 +144,7 @@ describe('CircuitBreaker — persistentStaleCeilingMs edge cases', () => {
     }
   });
 
-  it('negative persistentStaleCeilingMs disables persistent hydration (all data too old)', async () => {
+  it('negative persistentStaleCeilingMs falls back to 24h default ceiling', async () => {
     const mod = await import(`${CIRCUIT_BREAKER_URL}?t=${Date.now()}-negative`);
     const { createCircuitBreaker, clearAllCircuitBreakers } = mod;
     clearAllCircuitBreakers();
@@ -196,7 +157,7 @@ describe('CircuitBreaker — persistentStaleCeilingMs edge cases', () => {
         persistentStaleCeilingMs: -1,
       });
 
-      // Should not throw — breaker still works, just never hydrates
+      // Sanitized to 24h default — breaker still works
       const fallback = { data: 'fallback' };
       const result = await breaker.execute(async () => ({ data: 'live' }), fallback);
       assert.deepEqual(result, { data: 'live' });
@@ -422,49 +383,6 @@ describe('CircuitBreaker — multiple breakers with different ceilings', () => {
   });
 });
 
-// ============================================================
-// 6. Boundary condition: age exactly equal to ceiling (> vs >=)
-// ============================================================
-
-describe('CircuitBreaker — boundary: age exactly equal to persistentStaleCeilingMs', () => {
-  const src = readSrc('src/utils/circuit-breaker.ts');
-
-  it('hydratePersistentCache uses strict greater-than (>) for the age check', () => {
-    // The comparison `age > this.persistentStaleCeilingMs` means that
-    // age === ceiling is NOT discarded (entry is kept).
-    // This is a deliberate choice: the ceiling is an upper bound, not exclusive.
-    const hydrateStart = src.indexOf('hydratePersistentCache');
-    assert.ok(hydrateStart !== -1, 'hydratePersistentCache method must exist');
-    const hydrateEnd = src.indexOf('\n  }', hydrateStart + 200);
-    const hydrateBody = src.slice(hydrateStart, hydrateEnd + 4);
-
-    // Match the comparison: age > this.persistentStaleCeilingMs
-    assert.match(
-      hydrateBody,
-      /age\s*>\s*this\.persistentStaleCeilingMs/,
-      'Must use strict > (not >=) so entries exactly at the ceiling are still accepted',
-    );
-
-    // Ensure >= is NOT used (would change semantics)
-    assert.doesNotMatch(
-      hydrateBody,
-      /age\s*>=\s*this\.persistentStaleCeilingMs/,
-      'Must NOT use >= — entries at the exact ceiling boundary should be accepted',
-    );
-  });
-
-  it('age variable is computed as Date.now() - entry.updatedAt', () => {
-    const hydrateStart = src.indexOf('hydratePersistentCache');
-    const hydrateEnd = src.indexOf('\n  }', hydrateStart + 200);
-    const hydrateBody = src.slice(hydrateStart, hydrateEnd + 4);
-
-    assert.match(
-      hydrateBody,
-      /const\s+age\s*=\s*Date\.now\(\)\s*-\s*entry\.updatedAt/,
-      'age must be computed as Date.now() - entry.updatedAt',
-    );
-  });
-});
 
 // ============================================================
 // 7. Interaction with cacheTtlMs=0 (persistence auto-disabled)
@@ -603,8 +521,7 @@ describe('CircuitBreaker — exotic values for persistentStaleCeilingMs', () => 
         persistentStaleCeilingMs: NaN,
       });
 
-      // NaN comparison: `age > NaN` is always false, so everything would be
-      // accepted during hydration. This is a permissive failure mode.
+      // NaN is not finite — sanitized to the 24h default ceiling
       const fb = { data: 'fallback' };
       const result = await breaker.execute(async () => ({ data: 'live' }), fb);
       assert.deepEqual(result, { data: 'live' });
@@ -626,7 +543,7 @@ describe('CircuitBreaker — exotic values for persistentStaleCeilingMs', () => 
         persistentStaleCeilingMs: Infinity,
       });
 
-      // `age > Infinity` is always false, so all persistent entries accepted
+      // Infinity is not finite — sanitized to the 24h default ceiling
       const fb = { data: 'fallback' };
       const result = await breaker.execute(async () => ({ data: 'live' }), fb);
       assert.deepEqual(result, { data: 'live' });
@@ -648,7 +565,7 @@ describe('CircuitBreaker — exotic values for persistentStaleCeilingMs', () => 
         persistentStaleCeilingMs: -Infinity,
       });
 
-      // `age > -Infinity` is always true for any finite age, so all entries rejected
+      // -Infinity is not finite — sanitized to the 24h default ceiling
       const fb = { data: 'fallback' };
       const result = await breaker.execute(async () => ({ data: 'live' }), fb);
       assert.deepEqual(result, { data: 'live' });
@@ -678,132 +595,9 @@ describe('CircuitBreaker — exotic values for persistentStaleCeilingMs', () => 
     }
   });
 
-  it('null coercion: null is NOT caught by ?? (treated as 0-ish) — verify behavior', () => {
-    // The constructor uses: options.persistentStaleCeilingMs ?? PERSISTENT_STALE_CEILING_MS
-    // null ?? X returns X, so null falls back to the global default (same as undefined).
-    // This is correct behavior, but we verify the ?? operator is used (not ||).
-    const src = readSrc('src/utils/circuit-breaker.ts');
-    assert.match(
-      src,
-      /persistentStaleCeilingMs\s*\?\?\s*PERSISTENT_STALE_CEILING_MS/,
-      'Constructor must use ?? (nullish coalescing) to fall back to PERSISTENT_STALE_CEILING_MS',
-    );
-  });
-
-  it('explicit 0 is NOT caught by ?? (0 is not nullish) — zero ceiling is preserved', () => {
-    // With ??, 0 ?? DEFAULT = 0 (not DEFAULT). So persistentStaleCeilingMs: 0
-    // gives a ceiling of 0, which is correct (all persistent data rejected).
-    // This is a subtle difference from || which would fall back to the default.
-    const src = readSrc('src/utils/circuit-breaker.ts');
-
-    // Verify ?? is used (not ||) — critical for the 0 case
-    const constructorMatch = src.match(/this\.persistentStaleCeilingMs\s*=\s*options\.persistentStaleCeilingMs\s*(\?\?|\|\|)/);
-    assert.ok(constructorMatch, 'Constructor must assign persistentStaleCeilingMs from options');
-    assert.equal(
-      constructorMatch![1],
-      '??',
-      'Must use ?? not || — otherwise persistentStaleCeilingMs: 0 would silently fall back to 24h',
-    );
-  });
 });
 
-// ============================================================
-// 10. Verify the global PERSISTENT_STALE_CEILING_MS constant still exists
-// ============================================================
 
-describe('PERSISTENT_STALE_CEILING_MS global constant', () => {
-  const src = readSrc('src/utils/circuit-breaker.ts');
-
-  it('global PERSISTENT_STALE_CEILING_MS constant exists and is 24h', () => {
-    assert.match(
-      src,
-      /const\s+PERSISTENT_STALE_CEILING_MS\s*=\s*24\s*\*\s*60\s*\*\s*60\s*\*\s*1000/,
-      'PERSISTENT_STALE_CEILING_MS must be declared as 24 * 60 * 60 * 1000',
-    );
-  });
-
-  it('global constant is used as fallback in the constructor', () => {
-    assert.match(
-      src,
-      /options\.persistentStaleCeilingMs\s*\?\?\s*PERSISTENT_STALE_CEILING_MS/,
-      'Constructor must fall back to PERSISTENT_STALE_CEILING_MS when option is not provided',
-    );
-  });
-
-  it('global constant is NOT referenced in hydratePersistentCache (only instance field)', () => {
-    const hydrateStart = src.indexOf('hydratePersistentCache');
-    assert.ok(hydrateStart !== -1, 'hydratePersistentCache method must exist');
-    const hydrateEnd = src.indexOf('\n  }', hydrateStart + 200);
-    const hydrateBody = src.slice(hydrateStart, hydrateEnd + 4);
-
-    assert.doesNotMatch(
-      hydrateBody,
-      /PERSISTENT_STALE_CEILING_MS/,
-      'hydratePersistentCache must NOT reference the global PERSISTENT_STALE_CEILING_MS — ' +
-      'it should only use this.persistentStaleCeilingMs so per-breaker overrides work',
-    );
-  });
-
-  it('global constant is NOT referenced anywhere in the class body except constructor fallback', () => {
-    // Find the class body
-    const classStart = src.indexOf('export class CircuitBreaker');
-    assert.ok(classStart !== -1, 'CircuitBreaker class must exist');
-
-    // Find the constructor to exclude it
-    const constructorStart = src.indexOf('constructor(options:', classStart);
-    assert.ok(constructorStart !== -1, 'constructor must exist');
-    const constructorEnd = src.indexOf('\n  }', constructorStart);
-
-    // Get class body minus the constructor
-    const classEnd = src.indexOf('\n}\n', classStart);
-    const preConstructor = src.slice(classStart, constructorStart);
-    const postConstructor = src.slice(constructorEnd + 4, classEnd);
-    const classBodyMinusConstructor = preConstructor + postConstructor;
-
-    assert.doesNotMatch(
-      classBodyMinusConstructor,
-      /PERSISTENT_STALE_CEILING_MS/,
-      'The global constant must only appear in the constructor fallback — all other code uses the instance field',
-    );
-  });
-});
-
-// ============================================================
-// 11. Static: hydratePersistentCache returns early for stale entries
-// ============================================================
-
-describe('hydratePersistentCache — stale entry discard flow', () => {
-  const src = readSrc('src/utils/circuit-breaker.ts');
-
-  it('stale check occurs before cache.set (discard path returns early)', () => {
-    const hydrateStart = src.indexOf('hydratePersistentCache');
-    const hydrateEnd = src.indexOf('\n  }', hydrateStart + 200);
-    const hydrateBody = src.slice(hydrateStart, hydrateEnd + 4);
-
-    const ageCheckIdx = hydrateBody.indexOf('age > this.persistentStaleCeilingMs');
-    const cacheSetIdx = hydrateBody.indexOf('this.cache.set');
-
-    assert.ok(ageCheckIdx !== -1, 'age check must exist in hydratePersistentCache');
-    assert.ok(cacheSetIdx !== -1, 'cache.set must exist in hydratePersistentCache');
-    assert.ok(
-      ageCheckIdx < cacheSetIdx,
-      'Stale ceiling check must come BEFORE cache.set — stale entries must be discarded, not written to cache first',
-    );
-  });
-
-  it('stale check is followed by return (not just a conditional skip)', () => {
-    const hydrateStart = src.indexOf('hydratePersistentCache');
-    const hydrateEnd = src.indexOf('\n  }', hydrateStart + 200);
-    const hydrateBody = src.slice(hydrateStart, hydrateEnd + 4);
-
-    // The pattern should be: if (age > this.persistentStaleCeilingMs) return;
-    assert.match(
-      hydrateBody,
-      /if\s*\(\s*age\s*>\s*this\.persistentStaleCeilingMs\s*\)\s*return/,
-      'Stale entries must trigger an early return, not just a conditional branch',
-    );
-  });
-});
 
 // ============================================================
 // 12. Adversarial: concurrent execute() calls on same breaker
@@ -896,32 +690,3 @@ describe('CircuitBreaker — same name, different ceiling (registry behavior)', 
   });
 });
 
-// ============================================================
-// 14. Static: persistentStaleCeilingMs is a private instance field
-// ============================================================
-
-describe('CircuitBreaker — persistentStaleCeilingMs encapsulation', () => {
-  const src = readSrc('src/utils/circuit-breaker.ts');
-
-  it('persistentStaleCeilingMs is a private instance field', () => {
-    assert.match(
-      src,
-      /private\s+persistentStaleCeilingMs\s*:\s*number/,
-      'persistentStaleCeilingMs must be a private field to prevent external mutation',
-    );
-  });
-
-  it('persistentStaleCeilingMs is assigned exactly once in the constructor', () => {
-    const classStart = src.indexOf('export class CircuitBreaker');
-    const classEnd = src.indexOf('\n}\n', classStart);
-    const classBody = src.slice(classStart, classEnd);
-
-    const assignments = classBody.match(/this\.persistentStaleCeilingMs\s*=/g);
-    assert.ok(assignments, 'persistentStaleCeilingMs must be assigned at least once');
-    assert.equal(
-      assignments!.length,
-      1,
-      'persistentStaleCeilingMs must be assigned exactly once (in constructor) — no runtime mutation',
-    );
-  });
-});

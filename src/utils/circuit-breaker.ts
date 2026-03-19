@@ -71,7 +71,8 @@ export class CircuitBreaker<T> {
       ? false
       : (options.persistCache ?? false);
     this.maxCacheEntries = options.maxCacheEntries ?? DEFAULT_MAX_CACHE_ENTRIES;
-    this.persistentStaleCeilingMs = options.persistentStaleCeilingMs ?? PERSISTENT_STALE_CEILING_MS;
+    const rawCeiling = options.persistentStaleCeilingMs ?? PERSISTENT_STALE_CEILING_MS;
+    this.persistentStaleCeilingMs = Number.isFinite(rawCeiling) && rawCeiling >= 0 ? rawCeiling : PERSISTENT_STALE_CEILING_MS;
   }
 
   private resolveCacheKey(cacheKey?: string): string {
