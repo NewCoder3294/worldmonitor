@@ -17,7 +17,7 @@ export interface BreakerDataState {
   offline: boolean;
 }
 
-export interface CircuitBreakerOptions {
+export interface CircuitBreakerOptions<T = unknown> {
   name: string;
   maxFailures?: number;
   cooldownMs?: number;
@@ -26,6 +26,10 @@ export interface CircuitBreakerOptions {
    *  Opt-in only — cached payloads must be JSON-safe (no Date objects).
    *  Auto-disabled when cacheTtlMs === 0. */
   persistCache?: boolean;
+  /** Revive deserialized data after loading from persistent storage.
+   *  Use this to convert JSON-parsed strings back to Date objects or other
+   *  non-JSON-safe types. Called only on data loaded from IndexedDB. */
+  revivePersistedData?: (data: T) => T;
   /** Maximum in-memory cache entries before LRU eviction. Default: 256. */
   maxCacheEntries?: number;
   /** Override the global 24h persistent stale ceiling for this breaker.
@@ -55,6 +59,7 @@ export class CircuitBreaker<T> {
   private cooldownMs: number;
   private cacheTtlMs: number;
   private persistEnabled: boolean;
+  private revivePersistedData: ((data: T) => T) | undefined;
   private persistentLoadedKeys = new Set<string>();
   private persistentLoadPromises = new Map<string, Promise<void>>();
   private lastDataState: BreakerDataState = { mode: 'unavailable', timestamp: null, offline: false };
@@ -62,7 +67,7 @@ export class CircuitBreaker<T> {
   private maxCacheEntries: number;
   private persistentStaleCeilingMs: number;
 
-  constructor(options: CircuitBreakerOptions) {
+  constructor(options: CircuitBreakerOptions<T>) {
     this.name = options.name;
     this.maxFailures = options.maxFailures ?? DEFAULT_MAX_FAILURES;
     this.cooldownMs = options.cooldownMs ?? DEFAULT_COOLDOWN_MS;
@@ -70,6 +75,7 @@ export class CircuitBreaker<T> {
     this.persistEnabled = this.cacheTtlMs === 0
       ? false
       : (options.persistCache ?? false);
+    this.revivePersistedData = options.revivePersistedData;
     this.maxCacheEntries = options.maxCacheEntries ?? DEFAULT_MAX_CACHE_ENTRIES;
     const rawCeiling = options.persistentStaleCeilingMs ?? PERSISTENT_STALE_CEILING_MS;
     this.persistentStaleCeilingMs = Number.isFinite(rawCeiling) && rawCeiling >= 0 ? rawCeiling : PERSISTENT_STALE_CEILING_MS;
@@ -154,7 +160,8 @@ export class CircuitBreaker<T> {
 
         // Only hydrate if in-memory cache is empty (don't overwrite live data)
         if (this.getCacheEntry(cacheKey) === null) {
-          this.cache.set(cacheKey, { data: entry.data, timestamp: entry.updatedAt });
+          const data = this.revivePersistedData ? this.revivePersistedData(entry.data) : entry.data;
+          this.cache.set(cacheKey, { data, timestamp: entry.updatedAt });
           this.evictIfNeeded();
           const withinTtl = (Date.now() - entry.updatedAt) < this.cacheTtlMs;
           this.lastDataState = {
@@ -286,6 +293,20 @@ export class CircuitBreaker<T> {
     }
   }
 
+  /** Clear only the in-memory cache without touching persistent storage.
+   *  Use when the caller wants fresh live data but must not destroy the
+   *  persisted fallback that a concurrent hydration may still need. */
+  clearMemoryCache(cacheKey?: string): void {
+    if (cacheKey !== undefined) {
+      this.evictCacheKey(this.resolveCacheKey(cacheKey));
+      return;
+    }
+    this.cache.clear();
+    this.backgroundRefreshPromises.clear();
+    this.persistentLoadPromises.clear();
+    this.persistentLoadedKeys.clear();
+  }
+
   recordFailure(error?: string): void {
     this.state.failures++;
     this.state.lastError = error;
@@ -377,7 +398,7 @@ export class CircuitBreaker<T> {
 // Registry of circuit breakers for global status
 const breakers = new Map<string, CircuitBreaker<unknown>>();
 
-export function createCircuitBreaker<T>(options: CircuitBreakerOptions): CircuitBreaker<T> {
+export function createCircuitBreaker<T>(options: CircuitBreakerOptions<T>): CircuitBreaker<T> {
   const breaker = new CircuitBreaker<T>(options);
   breakers.set(options.name, breaker as CircuitBreaker<unknown>);
   return breaker;

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { loadEnvFile, CHROME_UA, runSeed, writeExtraKeyWithMeta, sleep, verifySeedKey } from './_seed-utils.mjs';
+import { BUDGET_LAB_TARIFFS_URL, htmlToPlainText, toIsoDate, parseBudgetLabEffectiveTariffHtml } from './_trade-parse-utils.mjs';
 
 loadEnvFile(import.meta.url);
 
@@ -60,7 +61,7 @@ async function fetchShippingRates() {
       if (!resp.ok) { console.warn(`  FRED ${cfg.seriesId}: HTTP ${resp.status}`); continue; }
       const data = await resp.json();
       const observations = (data.observations || [])
-        .map(o => { const v = parseFloat(o.value); return isNaN(v) || o.value === '.' ? null : { date: o.date, value: v }; })
+        .map(o => { const v = parseFloat(o.value); return Number.isNaN(v) || o.value === '.' ? null : { date: o.date, value: v }; })
         .filter(Boolean).reverse();
       if (observations.length === 0) continue;
       const current = observations[observations.length - 1].value;
@@ -148,7 +149,7 @@ async function fetchBDI() {
     let articleDate = new Date().toISOString().slice(0, 10);
     if (dateMatch) {
       const parsed = new Date(`${dateMatch[2]} ${dateMatch[1]}, ${dateMatch[3]}`);
-      if (!isNaN(parsed.getTime())) articleDate = parsed.toISOString().slice(0, 10);
+      if (!Number.isNaN(parsed.getTime())) articleDate = parsed.toISOString().slice(0, 10);
     }
 
     const indices = [];
@@ -234,6 +235,30 @@ async function wtoFetch(path, params) {
   return resp.json();
 }
 
+async function fetchBudgetLabEffectiveTariffRate() {
+  try {
+    const resp = await fetch(BUDGET_LAB_TARIFFS_URL, {
+      headers: { Accept: 'text/html', 'User-Agent': CHROME_UA },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) {
+      console.warn(`  Budget Lab tariffs: HTTP ${resp.status}`);
+      return null;
+    }
+    const html = await resp.text();
+    const parsed = parseBudgetLabEffectiveTariffHtml(html);
+    if (!parsed) {
+      console.warn('  Budget Lab tariffs: effective tariff rate not found in page content');
+      return null;
+    }
+    console.log(`  Budget Lab effective tariff: ${parsed.tariffRate.toFixed(1)}%${parsed.observationPeriod ? ` (${parsed.observationPeriod})` : ''}`);
+    return parsed;
+  } catch (e) {
+    console.warn(`  Budget Lab tariffs: ${e.message}`);
+    return null;
+  }
+}
+
 // ─── Trade Flows (WTO) — pre-seed major reporters vs World + key bilateral pairs ───
 
 const BILATERAL_PAIRS = [
@@ -254,7 +279,7 @@ function parseFlowRows(data, indicator) {
   return dataset.map(row => {
     const year = parseInt(row.Year ?? row.year ?? '', 10);
     const value = parseFloat(row.Value ?? row.value ?? '');
-    return !isNaN(year) && !isNaN(value) ? { year, indicator, value } : null;
+    return !Number.isNaN(year) && !Number.isNaN(value) ? { year, indicator, value } : null;
   }).filter(Boolean);
 }
 
@@ -336,7 +361,7 @@ async function fetchTradeBarriers() {
       const year = parseInt(row.Year ?? row.year ?? '0', 10);
       const value = parseFloat(row.Value ?? row.value ?? '');
       const cc = String(row.ReportingEconomyCode ?? '');
-      return !isNaN(year) && !isNaN(value) && cc ? { country: WTO_MEMBER_CODES[cc] ?? '', countryCode: cc, year, value } : null;
+      return !Number.isNaN(year) && !Number.isNaN(value) && cc ? { country: WTO_MEMBER_CODES[cc] ?? '', countryCode: cc, year, value } : null;
     }).filter(Boolean);
   };
 
@@ -400,14 +425,14 @@ async function fetchTradeRestrictions() {
 
   const restrictions = [...latestByCountry.values()].map(row => {
     const value = parseFloat(row.Value ?? row.value ?? '');
-    if (isNaN(value)) return null;
+    if (Number.isNaN(value)) return null;
     const cc = String(row.ReportingEconomyCode ?? '');
     const year = String(row.Year ?? row.year ?? '');
     return {
       id: `${cc}-${year}-${row.IndicatorCode ?? ''}`,
       reportingCountry: WTO_MEMBER_CODES[cc] ?? String(row.ReportingEconomy ?? ''),
       affectedCountry: 'All trading partners', productSector: 'All products',
-      measureType: 'MFN Applied Tariff', description: `Average tariff rate: ${value.toFixed(1)}%`,
+      measureType: 'WTO MFN Baseline', description: `WTO MFN baseline: ${value.toFixed(1)}%`,
       status: value > 10 ? 'high' : value > 5 ? 'moderate' : 'low',
       notifiedAt: year, sourceUrl: 'https://stats.wto.org',
     };
@@ -426,6 +451,7 @@ async function fetchTradeRestrictions() {
 async function fetchTariffTrends() {
   const currentYear = new Date().getFullYear();
   const trends = {};
+  const usEffectiveTariffRate = await fetchBudgetLabEffectiveTariffRate();
 
   for (const reporter of MAJOR_REPORTERS) {
     const years = 10;
@@ -438,7 +464,7 @@ async function fetchTariffTrends() {
     const datapoints = dataset.map(row => {
       const year = parseInt(row.Year ?? row.year ?? '', 10);
       const tariffRate = parseFloat(row.Value ?? row.value ?? '');
-      if (isNaN(year) || isNaN(tariffRate)) return null;
+      if (Number.isNaN(year) || Number.isNaN(tariffRate)) return null;
       return {
         reportingCountry: WTO_MEMBER_CODES[reporter] ?? reporter,
         partnerCountry: 'World', productSector: 'All products',
@@ -449,7 +475,12 @@ async function fetchTariffTrends() {
 
     if (datapoints.length > 0) {
       const cacheKey = `trade:tariffs:v1:${reporter}:all:${years}`;
-      trends[cacheKey] = { datapoints, fetchedAt: new Date().toISOString(), upstreamUnavailable: false };
+      trends[cacheKey] = {
+        datapoints,
+        ...(reporter === '840' && usEffectiveTariffRate ? { effectiveTariffRate: usEffectiveTariffRate } : {}),
+        fetchedAt: new Date().toISOString(),
+        upstreamUnavailable: false,
+      };
     }
     await sleep(500);
   }
@@ -566,7 +597,7 @@ function validate(data) {
 runSeed('supply_chain', 'shipping', KEYS.shipping, fetchAll, {
   validateFn: validate,
   ttlSeconds: SHIPPING_TTL,
-  sourceVersion: 'fred-wto-sse-bdi',
+  sourceVersion: 'fred-wto-sse-bdi-budgetlab',
 }).catch((err) => {
   const _cause = err.cause ? ` (cause: ${err.cause.message || err.cause.code || err.cause})` : ''; console.error('FATAL:', (err.message || err) + _cause);
   process.exit(1);
